@@ -1,28 +1,172 @@
-import pandas as pd
-
+# CPU
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 from sklearn.decomposition import PCA
 from scipy.interpolate import RBFInterpolator
 
-from concurrent.futures import ProcessPoolExecutor
+try:
+    import cupy as cp
+    from cuml.neighbors import NearestNeighbors as CudaNearestNeighbors
+    from cuml.decomposition import PCA as CudaPCA
+    from cupyx.scipy.interpolate import RBFInterpolator as CudaRBFInterpolator
+    cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
+    GPU_availability = True
+except ImportError:
+    GPU_availability = False
+    import warnings
+    warnings.warn("Unable to import one of the GPU-based libraries. GPU computing unavailable.", ImportWarning)
 
-import cupy as cp
-from cuml.neighbors import NearestNeighbors as CudaNearestNeighbors
-from cuml.decomposition import PCA as CudaPCA
-from cupyx.scipy.interpolate import RBFInterpolator as CudaRBFInterpolator
 
+import pandas as pd
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
-from FADEx_plotting import _image_explanation_plot, _explanation_plot, _interactive_plot, _importance_plot
 
-cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
+def _explanation_plot(self, phi, spectral_norm, explain_index, width, height):
+
+    if(self.use_GPU):
+        phi = phi.get()
+        spectral_norm = spectral_norm.get()
+
+    indices = np.argsort(np.abs(phi))[::-1]
+    phi_sorted = phi[indices]
+    feature_names_sorted = [self.feature_names[i] for i in indices]
+
+    plt.figure(figsize=(6, height))
+    y_pos = np.arange(len(phi_sorted))
+    plt.barh(y_pos, phi_sorted, color=['red' if val < 0 else 'green' for val in phi_sorted])
+    plt.yticks(y_pos, feature_names_sorted, fontsize=12)
+    plt.xticks([]) 
+    plt.gca().invert_yaxis() 
+    plt.xlabel("Importance Values", fontsize=14)
+    plt.title(f"Feature Importance for instance {explain_index} (spectral norm = {spectral_norm:.3f})")
+    plt.axvline(x=0, color='black', linewidth=1)
+    plt.tight_layout()
+    plt.show()
+
+
+def _interactive_plot(self, width, height):
+
+    width = width * 100
+    height = height * 100
+
+    if(self.use_GPU):
+        low_dim_data = self.low_dim_data.get()
+    else:
+        low_dim_data = self.low_dim_data
+
+    formatted_text = []
+    for i, phi_row in enumerate(self.all_phis):
+
+        sorted_data = sorted(
+            zip(self.feature_names, phi_row),
+            key=lambda x: abs(x[1]),
+            reverse=True
+        )
+
+        features_str = "<br>".join(
+            f"{feature_name}: {phi_value:.3f}"
+            for feature_name, phi_value in sorted_data
+        )
+
+
+        classe_str = ""
+        if self.classes_names is not None:
+            classe_str = f"Class: {self.classes_names[i]}<br>"
+
+        norma_str = f"Spectral Norm: {self.all_norms[i]:.3f}"
+
+        info_str = (
+            f"{classe_str}"
+            f"ID: {i}<br>"
+            f"{norma_str}"
+            f"<br><br>"
+            f"{features_str}"
+        )
+        formatted_text.append(info_str)
+
+    norm_diff = np.abs(self.all_norms - 1)
+    cmin_val = float(np.min(norm_diff))
+    cmax_val = float(np.max(norm_diff))
+
+    colorscale = [
+        [0.0, 'green'],
+        [0.5, 'yellow'],
+        [1.0, 'red']
+    ]
+
+    fig = go.Figure(data=go.Scatter(
+        x=low_dim_data[:, 0],
+        y=low_dim_data[:, 1],
+        mode='markers',
+        marker=dict(
+            size=7,
+            color=norm_diff,
+            colorscale=colorscale,
+            cmin=cmin_val,
+            cmax=cmax_val,
+            showscale=True
+        ),
+        text=formatted_text,
+        hovertemplate='%{text}<extra></extra>'
+    ))
+
+    mean_val = np.mean(self.all_norms)
+
+    fig.update_layout(
+        title=f"Interactive Plot | Mean Spectral Norm: {mean_val:.3f}",
+        xaxis_title="Dimension 1",
+        yaxis_title="Dimension 2",
+        hovermode='closest',
+        width=width,
+        height=height,
+    )
+
+    fig.update_xaxes(showgrid=False, showticklabels=False, ticks='')
+    fig.update_yaxes(showgrid=False, showticklabels=False, ticks='')
+
+
+    fig.show()
+
+
+
+def _importance_plot(self, width, height, n_top):
+
+    phi_df = pd.DataFrame(self.all_phis, columns=[f'Feature {i}' for i in range(self.n_features)])
+    if self.feature_names is not None:
+        phi_df.columns = self.feature_names
+
+    feature_sums = phi_df.sum()
+    feature_sums_sorted = feature_sums.sort_values(ascending=False)
+    phi_df = phi_df[feature_sums_sorted.index]
+
+    feature_sums = phi_df.sum()
+    feature_sums_sorted = feature_sums.sort_values(ascending=False)
+    feature_sums_sorted = feature_sums_sorted.head(n_top)
+
+    plt.figure(figsize=(width, height))
+    plt.barh(feature_sums_sorted.index, feature_sums_sorted.values)
+    plt.title("FADEx Feature Importance Plot")
+    plt.xlabel("Importance Values")
+
+    plt.tick_params(
+        axis='y',          
+        which='both',     
+        labelsize=14
+    )
+    plt.xticks([])
+
+    
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    # plt.savefig("synthetic_importance_ranking.svg", format="svg", dpi=300, bbox_inches='tight', pad_inches=0.1)
+
+    plt.show()
 
 class FADEx:
     '''
     Local explainability method for dimensionality reduction (DR) algorithms using Jacobian-based analysis.
-    This class provides tools to explain the importance of features in the original high-dimensional space
-    by analyzing the local behavior of the DR mapping.
 
     Parameters
     ----------
@@ -41,34 +185,24 @@ class FADEx:
     classes_names : list of str, optional
         Names of the classes for each instance.
 
-    RBFkernel : str, default='cubic'
+    RBF_kernel : str, default='cubic'
         The kernel used by the RBFInterpolator.
 
     pre_dr : int, optional
         If not None, applies preliminary dimensionality reduction (PCA) to the high-dimensional data,
         reducing it to `pre_dr` dimensions.
 
-    RBFepsilon : float, default=0.001
+    RBF_epsilon : float, default=0.001
         The epsilon parameter for the RBF kernel.
 
-    RBFdegree : float, default=1
+    RBF_degree : float, default=1
         The degree parameter for the RBF kernel.
 
-    RBFsmoothing : float, default=0
+    RBF_smoothing : float, default=0
         The smoothing parameter for the RBF kernel.
 
-    useGPU : bool, default=False
+    use_GPU : bool, default=False
         If True, uses GPU acceleration for computations.
-
-    distanceAdjustMethod : str, default='sqrt_inv'
-        Method to adjust the minimum distance for numerical stability. Options include 'sqrt_inv', 
-        'inv', 'log_inv', 'exp_neg', and 'power_neg'.
-
-    distAlpha : float, default=0.01
-        The alpha parameter for distance adjustment methods.
-
-    image : bool, default=False
-        If True, treats the data as images for visualization purposes.
 
     dist_sample : int, optional
         Number of samples to use for distance computation. If None, all data points are used.
@@ -76,36 +210,34 @@ class FADEx:
         
     def __init__(self, high_dim_data: np.ndarray, low_dim_data: np.ndarray, 
                 n_neighbors: int = None, feature_names: list = None, 
-                classes_names: list = None, RBFkernel: str = 'cubic',
-                pre_dr : int = None, RBFepsilon : float = 0.001, 
-                RBFdegree : float = 1, RBFsmoothing : float = 0, 
-                useGPU : bool = False, distanceAdjustMethod: str = 'sqrt_inv',
-                distAlpha : float = 0.01, image : bool = False,
-                dist_sample : int = None):
+                classes_names: list = None, RBF_kernel: str = 'cubic',
+                pre_dr : int = None, RBF_epsilon : float = 0.001, 
+                RBF_degree : float = 1, RBF_smoothing : float = 0, 
+                use_GPU : bool = False, dist_sample : int = None):
 
         self.n_neighbors = n_neighbors
         self.classes_names=classes_names
-        self.RBFkernel = RBFkernel
+        self.RBF_kernel = RBF_kernel
         self.all_phis = None
         self.h = None
         self.pre_dr = pre_dr
-        self.RBFdegree = RBFdegree
-        self.RBFsmoothing = RBFsmoothing
-        self.RBFepsilon = RBFepsilon
-        self.useGPU = useGPU
-        self.method = distanceAdjustMethod
-        self.alpha = distAlpha
-        self.image = image
+        self.RBF_degree = RBF_degree
+        self.RBF_smoothing = RBF_smoothing
+        self.RBF_epsilon = RBF_epsilon
+        self.use_GPU = use_GPU
         self.dist_sample = dist_sample
 
-        if(self.useGPU):
+        if(self.use_GPU and ~GPU_availability):
+            raise ImportError("The GPU option has been selected, but the required libraries are not available. "
+            "Please install cupy, cuml and cupyx or set use_GPU=False.")
+        elif(self.use_GPU and GPU_availability):
             self.high_dim_data = cp.array(high_dim_data)
             self.low_dim_data = cp.array(low_dim_data)
 
             self.xp = cp
             self.nbrs = CudaNearestNeighbors(n_neighbors=self.n_neighbors, metric='euclidean')
 
-            if(self.pre_dr):
+            if(self.pre_dr is not None):
                 self.pca = CudaPCA(n_components=self.pre_dr)
 
         else:
@@ -183,41 +315,9 @@ class FADEx:
 
         return (1 / self.xp.sqrt(D)) * min_distance
 
-    def _compute_jac_column(self, rbf, x, jac, i, j):
-        x_plus_h = x.copy()
-        x_plus_h[j] = x_plus_h[j] + self.h
-        x_minus_h = x.copy()
-        x_minus_h[j] = x_minus_h[j] - self.h
-
-        f_plus_h = rbf(x_plus_h.reshape(1, -1))[0]
-        f_minus_h = rbf(x_minus_h.reshape(1, -1))[0]
-
-        # if(h == 0):
-        #     h = 0.0001
-
-        derivative = (f_plus_h - f_minus_h) / (2*self.h)
-
-        jac[i, j] = derivative
-    
-    def _cuda_compute_jac_column(self, rbf, x, jac, i, j):
-
-        x_plus_h = x.copy()
-        x_plus_h[j] += self.h
-        x_minus_h = x.copy()
-        x_minus_h[j] -= self.h
-
-        f_plus_h = rbf(cp.asarray(x_plus_h).reshape(1, -1))[0]
-        f_minus_h = rbf(cp.asarray(x_minus_h).reshape(1, -1))[0]
-
-        # if h == 0:
-        #     h = 0.0001
-
-        derivative = (f_plus_h - f_minus_h) / (2 * self.h)
-        jac[i, j] = derivative
-
     def _compute_jac_vec(self, high_dim_point, low_dim_point, high_dim_nei, low_dim_nei):
 
-        if(self.useGPU):
+        if(self.use_GPU):
 
             jac = cp.zeros((len(low_dim_point), len(high_dim_point)), dtype=cp.float32)  
             x = high_dim_point
@@ -237,10 +337,10 @@ class FADEx:
                     rbf = CudaRBFInterpolator(
                         cp.asarray(high_dim_nei[start:end], dtype=cp.float32),
                         cp.asarray(low_dim_nei[start:end, i].reshape(-1, 1), dtype=cp.float32),
-                        kernel=self.RBFkernel, 
-                        epsilon=self.RBFepsilon, 
-                        degree=self.RBFdegree, 
-                        smoothing=self.RBFsmoothing
+                        kernel=self.RBF_kernel, 
+                        epsilon=self.RBF_epsilon, 
+                        degree=self.RBF_degree, 
+                        smoothing=self.RBF_smoothing
                     )
 
                     x_plus_list = []
@@ -281,10 +381,10 @@ class FADEx:
                 rbf = RBFInterpolator(
                     high_dim_nei, 
                     low_dim_nei[:, i].reshape(-1, 1),
-                    kernel=self.RBFkernel,
-                    epsilon=self.RBFepsilon,
-                    degree=self.RBFdegree,
-                    smoothing=self.RBFsmoothing
+                    kernel=self.RBF_kernel,
+                    epsilon=self.RBF_epsilon,
+                    degree=self.RBF_degree,
+                    smoothing=self.RBF_smoothing
                 )
 
                 x_plus_array = []
@@ -312,51 +412,9 @@ class FADEx:
                     jac[i, j] = derivative_j
 
             return jac
-        
-
-    def _compute_jac(self, high_dim_point, low_dim_point, high_dim_nei, low_dim_nei):
-
-        if self.useGPU:
-
-            jac = cp.zeros((len(low_dim_point), len(high_dim_point)), dtype=cp.float32)
-            x = high_dim_point 
-
-            for i in range(len(low_dim_point)):
-    
-                rbf = CudaRBFInterpolator(
-                    cp.asarray(high_dim_nei, dtype=cp.float32),
-                    cp.asarray(low_dim_nei[:, i].reshape(-1, 1), dtype=cp.float32),
-                    kernel=self.RBFkernel, 
-                    epsilon=self.RBFepsilon, 
-                    degree=self.RBFdegree, 
-                    smoothing=self.RBFsmoothing
-                )
-      
-                for j in range(len(high_dim_point)):
-                    self._cuda_compute_jac_column(rbf, x, jac, i, j)
-            return jac
-        else:
-
-            jac = np.zeros((len(low_dim_point), len(high_dim_point)))
-            x = high_dim_point
- 
-            for i in range(len(low_dim_point)):
-          
-                rbf = RBFInterpolator(
-                    high_dim_nei, 
-                    low_dim_nei[:, i].reshape(-1, 1), 
-                    kernel=self.RBFkernel, 
-                    epsilon=self.RBFepsilon, 
-                    degree=self.RBFdegree,
-                    smoothing=self.RBFsmoothing
-                )
-
-                for j in range(len(high_dim_point)):
-                    self._compute_jac_column(rbf, x, jac, i, j)
-            return jac
 
 
-    def fit(self, explain_index : int, show : bool = True, p : float = 0.5, width : int = 10, height : int = 8):
+    def fit(self, explain_index : int, show : bool = True, width : int = 10, height : int = 8):
         '''
         Computes the feature importance for a specific instance in the dataset.
 
@@ -367,9 +425,6 @@ class FADEx:
 
         show : bool, default=True
             If True, displays the explanation plot.
-
-        p : float, default=0.5
-            The importance threshold used during the image importance plot
 
         width : int, default=8
             The width of the plot.
@@ -382,14 +437,11 @@ class FADEx:
         phi : np.ndarray or cp.ndarray, shape (n_features,)
             The importance values for each feature.
 
-        importance_vector : list of int
-            The indices of features sorted by importance.
-
         spectral_norm : float
             The spectral norm of the Jacobian matrix.
         '''
+
         high_dim_point = self.high_dim_data[explain_index]
-        self.high_dim_point = self.high_dim_data[explain_index]
         low_dim_point = self.low_dim_data[explain_index]
 
 
@@ -410,10 +462,9 @@ class FADEx:
         # Distance Computing
         if(self.h is None):
             self.h = self._compute_distances_vec(self.high_dim_data)
-            print(f'h = {self.h}')
 
         # Jacobian Computing
-        self.jac = self._compute_jac_vec(
+        jac = self._compute_jac_vec(
             high_dim_point,
             low_dim_point,
             high_dim_nei,
@@ -421,74 +472,30 @@ class FADEx:
         )
 
         # Importance Computing
-        phi = self._compute_importance(self.jac, high_dim_point)
-
-        # Importance Vector
-        indexed_phi = list(enumerate(phi))
-        sorted_indices = sorted(indexed_phi, key=lambda x: x[1], reverse=True)
+        phi = self._compute_importance(jac, high_dim_point)
 
         # Spectral Norm
-        spectral_norm = self.xp.linalg.norm(self.jac, ord=2)
+        spectral_norm = self.xp.linalg.norm(jac, ord=2)
 
         if(np.isnan(spectral_norm)):
-            print('Spectral Norm = NaN')
+            raise ValueError("Spectral Norm is NaN.")
         
 
         if(show):
-
-            if(self.image):
-                _image_explanation_plot(self, phi, spectral_norm, high_dim_point, p)
-            else:
-                _explanation_plot(self, phi, spectral_norm, explain_index, width, height)
+            _explanation_plot(self, phi, spectral_norm, explain_index, width, height)
                 
 
 
-        return phi, self.jac, spectral_norm
+        return phi, spectral_norm
     
-    
-    def print_error(self, jacobian):
-        '''
-        outdated function
-        '''
-
-        self.jac = self.jac.get()
-
-        jac_true = jacobian(self.high_dim_point)
-
-        jac_error = np.linalg.norm(self.jac - jac_true)
-
-        jac_true_norm = np.linalg.norm(jac_true)
-
-        if jac_true_norm == 0:
-            raise ValueError("The norm of the true Jacobian is zero. Cannot compute relative error.")
-        else:
-            relative_error = (jac_error / jac_true_norm) * 100
-
-            print("Computed Jacobian error (absolute):", jac_error)
-            print("Computed Jacobian relative error (%): {:.2f}%".format(relative_error))
 
     # Auxiliary function for parallelism
     def _compute_phi(self, i):
-        phi, _, spec_norm = self.fit(i, show=False)
+        phi, spec_norm = self.fit(i, show=False)
         return phi, spec_norm
     
     # Applies fit function in the entire dataset
     def _fit_all(self):
-
-        with ProcessPoolExecutor(max_workers=2) as executor:
-            results = list(tqdm(
-                executor.map(self._compute_phi, range(self.n_samples)), 
-                total=self.n_samples, 
-                desc="Processing samples", 
-                unit="sample"
-            ))
-
-        all_phis, all_norms = zip(*results)
-        self.all_phis = np.array(all_phis)
-        self.all_norms = np.array(all_norms)   
- 
-
-    def _fit_all_sequential(self):
         results = [self._compute_phi(i) for i in tqdm(range(self.n_samples), desc="Processing samples", unit="sample")]
 
         all_phis, all_norms = zip(*results)
@@ -497,7 +504,7 @@ class FADEx:
 
 
 
-    def interactive_plot(self, width=None, height=None, fit_all_method='sequential'):
+    def interactive_plot(self, width : int = 10, height : int =8):
         '''
         Generates an interactive plot that shows the feature importance for every instance.
 
@@ -509,39 +516,31 @@ class FADEx:
         height : int, optional
             The height of the plot.
 
-        fit_all_method : str, default='sequential'
-            The method to compute feature importance for all instances. Options are 'sequential' or 'parallel'.
         '''
 
         if(self.all_phis is None):
-
-            if(fit_all_method == 'sequential'):
-                self._fit_all_sequential()
-            elif(fit_all_method == 'parallel'):
-                self._fit_all()
+            self._fit_all()
 
         _interactive_plot(self, width, height)
 
-    def importance_plot(self, width=10, height=8, fit_all_method='sequential', n_top=10):
+    def importance_plot(self, width : int = 10, height : int = 8, n_top : int = 10):
         '''
         Generates a plot of feature importance for all instances.
 
         Parameters
         ----------
-        fit_all_method : str, default='sequential'
-            The method to compute feature importance for all instances. Options are 'sequential' or 'parallel'.
+        width : int, optional
+            The width of the plot.
+
+        height : int, optional
+            The height of the plot.
+
+        n_top : int
+            Number of top features to be plotted.
         '''
 
         if(self.all_phis is None):
-
-            if(fit_all_method == 'sequential'):
-                self._fit_all_sequential()
-            elif(fit_all_method == 'parallel'):
-                self._fit_all()
+            self._fit_all()
 
 
         _importance_plot(self, width, height, n_top)
-
-    def get_mean_spectral_norm(self):
-        if(self.all_norms is not None):
-            return np.mean(self.all_norms)
