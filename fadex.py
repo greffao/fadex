@@ -190,7 +190,7 @@ class FADEx:
 
     pre_dr : int, optional
         If not None, applies preliminary dimensionality reduction (PCA) to the high-dimensional data,
-        reducing it to `pre_dr` dimensions.
+        reducing it to `pre_dr` dimensions, before computing the h in the finite differences method.
 
     RBF_epsilon : float, default=0.001
         The epsilon parameter for the RBF kernel.
@@ -315,14 +315,13 @@ class FADEx:
 
         return (1 / self.xp.sqrt(D)) * min_distance
 
-    def _compute_jac_vec(self, high_dim_point, low_dim_point, high_dim_nei, low_dim_nei):
+    def _compute_jac_vec(self, high_dim_point, low_dim_point, high_dim_nei, low_dim_nei, batch_size):
 
         if(self.use_GPU):
 
             jac = cp.zeros((len(low_dim_point), len(high_dim_point)), dtype=cp.float32)  
             x = high_dim_point
 
-            batch_size = 201
             num_batches = (len(low_dim_point) + batch_size - 1) // batch_size
 
             # For each line 
@@ -414,7 +413,7 @@ class FADEx:
             return jac
 
 
-    def fit(self, explain_index : int, show : bool = True, width : int = 10, height : int = 8):
+    def fit(self, explain_index : int, show : bool = True, width : int = 10, height : int = 8, batch_size : int = 200):
         '''
         Computes the feature importance for a specific instance in the dataset.
 
@@ -431,6 +430,9 @@ class FADEx:
 
         height : int, default=10
             The height of the plot.
+        
+        batch_size : int, default=200
+            Batch size for the Jacobian computation.
 
         Returns
         -------
@@ -469,6 +471,7 @@ class FADEx:
             low_dim_point,
             high_dim_nei,
             low_dim_nei,
+            batch_size
         )
 
         # Importance Computing
