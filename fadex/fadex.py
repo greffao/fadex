@@ -33,7 +33,7 @@ def _explanation_plot(self, phi, spectral_norm, explain_index, width, height):
     phi_sorted = phi[indices]
     feature_names_sorted = [self.feature_names[i] for i in indices]
 
-    plt.figure(figsize=(6, height))
+    plt.figure(figsize=(width, height))
     y_pos = np.arange(len(phi_sorted))
     plt.barh(y_pos, phi_sorted, color=['red' if val < 0 else 'green' for val in phi_sorted])
     plt.yticks(y_pos, feature_names_sorted, fontsize=12)
@@ -116,8 +116,6 @@ def _interactive_plot(self, width, height):
 
     fig.update_layout(
         title=f"Interactive Plot | Mean Spectral Norm: {mean_val:.3f}",
-        xaxis_title="Dimension 1",
-        yaxis_title="Dimension 2",
         hovermode='closest',
         width=width,
         height=height,
@@ -153,7 +151,7 @@ def _importance_plot(self, width, height, n_top):
     plt.tick_params(
         axis='y',          
         which='both',     
-        labelsize=14
+        labelsize=16
     )
     plt.xticks([])
 
