@@ -4,8 +4,8 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="fadex",
-    version="0.1.0",
+    name="fadex-exp",
+    version="0.1.1",
     author="Lucas Greff Meneses",
     author_email="lucasgreffmeneses@usp.br",
     description="A feature attribution explainability method for dimensionality reduction algorithms.",

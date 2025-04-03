@@ -23,22 +23,24 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
 
-def _explanation_plot(self, phi, spectral_norm, explain_index, width, height):
-
+def _explanation_plot(self, phi, spectral_norm, explain_index, width, height, n_top):
+    
     if(self.use_GPU):
         phi = phi.get()
         spectral_norm = spectral_norm.get()
 
     indices = np.argsort(np.abs(phi))[::-1]
-    phi_sorted = phi[indices]
-    feature_names_sorted = [self.feature_names[i] for i in indices]
+    
+    top_indices = indices[:n_top]
+    phi_top = phi[top_indices]
+    feature_names_top = [self.feature_names[i] for i in top_indices]
 
     plt.figure(figsize=(width, height))
-    y_pos = np.arange(len(phi_sorted))
-    plt.barh(y_pos, phi_sorted, color=['red' if val < 0 else 'green' for val in phi_sorted])
-    plt.yticks(y_pos, feature_names_sorted, fontsize=12)
-    plt.xticks([]) 
-    plt.gca().invert_yaxis() 
+    y_pos = np.arange(len(phi_top))
+    plt.barh(y_pos, phi_top, color=['red' if val < 0 else 'green' for val in phi_top])
+    plt.yticks(y_pos, feature_names_top, fontsize=12)
+    plt.xticks([])
+    plt.gca().invert_yaxis()
     plt.xlabel("Importance Values", fontsize=14)
     plt.title(f"Feature Importance for instance {explain_index} (spectral norm = {spectral_norm:.3f})")
     plt.axvline(x=0, color='black', linewidth=1)
@@ -72,8 +74,8 @@ def _interactive_plot(self, width, height):
 
 
         classe_str = ""
-        if self.classes_names is not None:
-            classe_str = f"Class: {self.classes_names[i]}<br>"
+        if self.class_names is not None:
+            classe_str = f"Class: {self.class_names[i]}<br>"
 
         norma_str = f"Spectral Norm: {self.all_norms[i]:.3f}"
 
@@ -180,7 +182,7 @@ class FADEx:
     feature_names : list of str, optional
         Names of the original features. If None, generic names are used for plotting.
 
-    classes_names : list of str, optional
+    class_names : list of str, optional
         Names of the classes for each instance.
 
     RBF_kernel : str, default='cubic'
@@ -208,13 +210,13 @@ class FADEx:
         
     def __init__(self, high_dim_data: np.ndarray, low_dim_data: np.ndarray, 
                 n_neighbors: int = None, feature_names: list = None, 
-                classes_names: list = None, RBF_kernel: str = 'cubic',
+                class_names: list = None, RBF_kernel: str = 'cubic',
                 pre_dr : int = None, RBF_epsilon : float = 0.001, 
                 RBF_degree : float = 1, RBF_smoothing : float = 0, 
                 use_GPU : bool = False, dist_sample : int = None):
 
         self.n_neighbors = n_neighbors
-        self.classes_names=classes_names
+        self.class_names=class_names
         self.RBF_kernel = RBF_kernel
         self.all_phis = None
         self.h = None
@@ -227,7 +229,7 @@ class FADEx:
 
         if(self.use_GPU and ~GPU_availability):
             raise ImportError("The GPU option has been selected, but the required libraries are not available. "
-            "Please install cupy, cuml and cupyx or set use_GPU=False.")
+            "Please install cupy and cuml or set use_GPU=False.")
         elif(self.use_GPU and GPU_availability):
             self.high_dim_data = cp.array(high_dim_data)
             self.low_dim_data = cp.array(low_dim_data)
@@ -411,7 +413,7 @@ class FADEx:
             return jac
 
 
-    def fit(self, explain_index : int, show : bool = True, width : int = 10, height : int = 8, batch_size : int = 200):
+    def fit(self, explain_index : int, show : bool = True, width : int = 10, height : int = 8, batch_size : int = 200, n_top : int = 10):
         '''
         Computes the feature importance for a specific instance in the dataset.
 
@@ -439,6 +441,9 @@ class FADEx:
 
         spectral_norm : float
             The spectral norm of the Jacobian matrix.
+
+        n_top : int
+            Number of top features to be plotted.
         '''
 
         high_dim_point = self.high_dim_data[explain_index]
@@ -483,7 +488,7 @@ class FADEx:
         
 
         if(show):
-            _explanation_plot(self, phi, spectral_norm, explain_index, width, height)
+            _explanation_plot(self, phi, spectral_norm, explain_index, width, height, n_top)
                 
 
 
@@ -500,8 +505,8 @@ class FADEx:
         results = [self._compute_phi(i) for i in tqdm(range(self.n_samples), desc="Processing samples", unit="sample")]
 
         all_phis, all_norms = zip(*results)
-        self.all_phis = np.array([arr.get() if isinstance(arr, cp.ndarray) else arr for arr in all_phis])
-        self.all_norms = np.array([arr.get() if isinstance(arr, cp.ndarray) else arr for arr in all_norms])
+        self.all_phis = np.array([arr.get() if GPU_availability and isinstance(arr, cp.ndarray) else arr for arr in all_phis])
+        self.all_norms = np.array([arr.get() if GPU_availability and isinstance(arr, cp.ndarray) else arr for arr in all_norms])
 
 
 
