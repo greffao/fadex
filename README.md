@@ -23,11 +23,9 @@ Use the following command in your terminal to install the module without the GPU
 pip install fadex-exp
 ```
 
-To install the module with the GPU libraries, use:
 
-```
-pip install fadex-exp[gpu]
-```
+If you want to enable **GPU acceleration**, you need to install the **RAPIDS** framework. Please follow the official instructions at [https://rapids.ai/start.html](https://rapids.ai/start.html).
+
 
 # FADEx Class
 
