@@ -36,7 +36,7 @@ The FADEx Class has the following signature:
 ```
 def __init__(self, high_dim_data: np.ndarray, low_dim_data: np.ndarray, 
                 n_neighbors: int = None, feature_names: list = None, 
-                classes_names: list = None, RBF_kernel: str = 'cubic',
+                class_names: list = None, RBF_kernel: str = 'cubic',
                 pre_dr : int = None, RBF_epsilon : float = 0.001, 
                 RBF_degree : float = 1, RBF_smoothing : float = 0, 
                 use_GPU : bool = False, dist_sample : int = None):
@@ -51,7 +51,7 @@ def __init__(self, high_dim_data: np.ndarray, low_dim_data: np.ndarray,
 #### Optional Parameters
 
 **feature_names** - A list with the feature names.<br>
-**classes_names** - A list with the class for each sample.<br>
+**class_names** - A list with the class for each sample.<br>
 **RBF_kernel, RBF_epsilon, RBF_degree, and RBF_smoothing** - `RBFInterpolator` parameters. <br>
 **pre_dr** - If provided, a preliminary dimensionality reduction (PCA) is applied to the high-dimensional data, reducing it to pre_dr dimensions before computing the step size in the finite differences method. This is crucial to avoid the curse of dimensionality.<br>
 **dist_sample** - The number of samples to use for distance computation. If set to `None`, all data points are used. This parameter helps reduce memory consumption. <br>
