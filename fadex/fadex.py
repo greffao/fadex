@@ -227,7 +227,7 @@ class FADEx:
         self.use_GPU = use_GPU
         self.dist_sample = dist_sample
 
-        if(self.use_GPU and ~GPU_availability):
+        if(self.use_GPU and not GPU_availability):
             raise ImportError("The GPU option has been selected, but the required libraries are not available. "
             "Please install cupy and cuml or set use_GPU=False.")
         elif(self.use_GPU and GPU_availability):
@@ -433,6 +433,9 @@ class FADEx:
         
         batch_size : int, default=200
             Batch size for the Jacobian computation.
+        
+        n_top : int
+            Number of top features to be plotted.
 
         Returns
         -------
@@ -441,9 +444,6 @@ class FADEx:
 
         spectral_norm : float
             The spectral norm of the Jacobian matrix.
-
-        n_top : int
-            Number of top features to be plotted.
         '''
 
         high_dim_point = self.high_dim_data[explain_index]
