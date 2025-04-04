@@ -53,14 +53,10 @@ def _interactive_plot(self, width, height):
     width = width * 100
     height = height * 100
 
-    if(self.use_GPU):
-        low_dim_data = self.low_dim_data.get()
-    else:
-        low_dim_data = self.low_dim_data
+    low_dim_data = self.low_dim_data
 
     formatted_text = []
     for i, phi_row in enumerate(self.all_phis):
-
         sorted_data = sorted(
             zip(self.feature_names, phi_row),
             key=lambda x: abs(x[1]),
@@ -72,10 +68,9 @@ def _interactive_plot(self, width, height):
             for feature_name, phi_value in sorted_data
         )
 
-
         classe_str = ""
-        if self.class_names is not None:
-            classe_str = f"Class: {self.class_names[i]}<br>"
+        if self.classes_names is not None:
+            classe_str = f"Class: {self.classes_names[i]}<br>"
 
         norma_str = f"Spectral Norm: {self.all_norms[i]:.3f}"
 
@@ -88,15 +83,19 @@ def _interactive_plot(self, width, height):
         )
         formatted_text.append(info_str)
 
-    norm_diff = np.abs(self.all_norms - 1)
+    # The distortion is based on the distance of the norm in relation to 1
+    norm_diff = np.abs(1 - self.all_norms)
     cmin_val = float(np.min(norm_diff))
     cmax_val = float(np.max(norm_diff))
 
-    colorscale = [
-        [0.0, 'green'],
-        [0.5, 'yellow'],
-        [1.0, 'red']
-    ]
+    # Normalizing   
+    if cmax_val - cmin_val == 0:
+        scaled_diff = np.zeros_like(norm_diff)
+    else:
+        scaled_diff = (norm_diff - cmin_val) / (cmax_val - cmin_val)
+
+    # Invert the scaled distortion by subtracting it from 1, effectively measuring how close each point is to the norm of 1
+    new_diff = np.abs(scaled_diff - 1)
 
     fig = go.Figure(data=go.Scatter(
         x=low_dim_data[:, 0],
@@ -104,10 +103,10 @@ def _interactive_plot(self, width, height):
         mode='markers',
         marker=dict(
             size=7,
-            color=norm_diff,
-            colorscale=colorscale,
-            cmin=cmin_val,
-            cmax=cmax_val,
+            color=new_diff,       
+            colorscale='Viridis', 
+            cmin=0,
+            cmax=1,
             showscale=True
         ),
         text=formatted_text,
@@ -118,14 +117,16 @@ def _interactive_plot(self, width, height):
 
     fig.update_layout(
         title=f"Interactive Plot | Mean Spectral Norm: {mean_val:.3f}",
+        xaxis_title="",  
+        yaxis_title="",  
         hovermode='closest',
         width=width,
         height=height,
     )
 
+
     fig.update_xaxes(showgrid=False, showticklabels=False, ticks='')
     fig.update_yaxes(showgrid=False, showticklabels=False, ticks='')
-
 
     fig.show()
 
