@@ -1,552 +1,898 @@
-# CPU
+'''
+FADEx — Feature Attribution and Distortion-based Explanation of
+Dimensionality Reduction
+
+Locally approximates the DR mapping with a weighted ridge least-squares fit,
+then derives per-feature importance scores from the SVD of the Jacobian.
+
+-------------------------------------------------------------------------------
+Author  : Lucas Greff Meneses
+Email   : lucasgreffmeneses@usp.br
+GitHub  : https://github.com/greffao/fadex
+-------------------------------------------------------------------------------
+
+Notes
+-----
+- Requires scikit-learn, numpy, scipy, pandas, matplotlib, plotly, and tqdm.
+- The code was commented by Claude Code
+
+'''
+
+# Numerics
 import numpy as np
+import pandas as pd
+
+# Machine Learning
 from sklearn.neighbors import NearestNeighbors
 from sklearn.decomposition import PCA
-from scipy.interpolate import RBFInterpolator
 
-try:
-    import cupy as cp
-    from cuml.neighbors import NearestNeighbors as CudaNearestNeighbors
-    from cuml.decomposition import PCA as CudaPCA
-    from cupyx.scipy.interpolate import RBFInterpolator as CudaRBFInterpolator
-    cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
-    GPU_availability = True
-except ImportError:
-    GPU_availability = False
-    import warnings
-    warnings.warn("Unable to import one of the GPU-based libraries. GPU computing unavailable.", ImportWarning)
-
-
-import pandas as pd
-from tqdm import tqdm
+# Plotting
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import plotly.graph_objects as go
 
+# Utils
+from tqdm.auto import tqdm
+from typing import List, Optional, Tuple
+import warnings
 
-def _explanation_plot(self, phi, spectral_norm, explain_index, width, height, n_top):
-    
-    if(self.use_GPU):
-        phi = phi.get()
-        spectral_norm = spectral_norm.get()
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+_VAR_THRESHOLD  = 1e-6    # Minimum neighborhood variance to keep a feature
+_MIN_KEEP       = 5       # Minimum number of features kept after variance filtering
+_RIDGE_EPS      = 1e-12   # Small epsilon to avoid division by zero in SVD importance
+_N_JOBS         = 2       # Parallelism for NearestNeighbors
+_MARKER_SIZE    = 7       # Default marker size in the interactive plot
+_COLORSCALE     = 'viridis'  # Default colorscale for the interactive plot
+_LABEL_FONTSIZE = 16      # y-axis label font size in importance_plot
+_VEC_SCALE      = 0.8     # Fraction of a grid cell used as max vector length
+_SIGMA_FACTOR   = 2.0     # Denominator factor in Gaussian weights: exp(-r²/(SIGMA_FACTOR·σ²))
 
-    indices = np.argsort(np.abs(phi))[::-1]
-    
-    top_indices = indices[:n_top]
-    phi_top = phi[top_indices]
-    feature_names_top = [self.feature_names[i] for i in top_indices]
-
-    plt.figure(figsize=(width, height))
-    y_pos = np.arange(len(phi_top))
-    plt.barh(y_pos, phi_top, color=['red' if val < 0 else 'green' for val in phi_top])
-    plt.yticks(y_pos, feature_names_top, fontsize=12)
-    plt.xticks([])
-    plt.gca().invert_yaxis()
-    plt.xlabel("Importance Values", fontsize=14)
-    plt.title(f"Feature Importance for instance {explain_index} (spectral norm = {spectral_norm:.3f})")
-    plt.axvline(x=0, color='black', linewidth=1)
-    plt.tight_layout()
-    plt.show()
-
-
-def _interactive_plot(self, width, height):
-
-    width = width * 100
-    height = height * 100
-
-    if(self.use_GPU):
-        low_dim_data = self.low_dim_data.get()
-    else:
-        low_dim_data = self.low_dim_data
-
-    formatted_text = []
-    for i, phi_row in enumerate(self.all_phis):
-
-        sorted_data = sorted(
-            zip(self.feature_names, phi_row),
-            key=lambda x: abs(x[1]),
-            reverse=True
-        )
-
-        features_str = "<br>".join(
-            f"{feature_name}: {phi_value:.3f}"
-            for feature_name, phi_value in sorted_data
-        )
-
-
-        classe_str = ""
-        if self.class_names is not None:
-            classe_str = f"Class: {self.class_names[i]}<br>"
-
-        norma_str = f"Spectral Norm: {self.all_norms[i]:.3f}"
-
-        info_str = (
-            f"{classe_str}"
-            f"ID: {i}<br>"
-            f"{norma_str}"
-            f"<br><br>"
-            f"{features_str}"
-        )
-        formatted_text.append(info_str)
-
-    norm_diff = np.abs(self.all_norms - 1)
-    cmin_val = float(np.min(norm_diff))
-    cmax_val = float(np.max(norm_diff))
-
-    colorscale = [
-        [0.0, 'green'],
-        [0.5, 'yellow'],
-        [1.0, 'red']
-    ]
-
-    fig = go.Figure(data=go.Scatter(
-        x=low_dim_data[:, 0],
-        y=low_dim_data[:, 1],
-        mode='markers',
-        marker=dict(
-            size=7,
-            color=norm_diff,
-            colorscale=colorscale,
-            cmin=cmin_val,
-            cmax=cmax_val,
-            showscale=True
-        ),
-        text=formatted_text,
-        hovertemplate='%{text}<extra></extra>'
-    ))
-
-    mean_val = np.mean(self.all_norms)
-
-    fig.update_layout(
-        title=f"Interactive Plot | Mean Spectral Norm: {mean_val:.3f}",
-        hovermode='closest',
-        width=width,
-        height=height,
-    )
-
-    fig.update_xaxes(showgrid=False, showticklabels=False, ticks='')
-    fig.update_yaxes(showgrid=False, showticklabels=False, ticks='')
-
-
-    fig.show()
-
-
-
-def _importance_plot(self, width, height, n_top):
-
-    phi_df = pd.DataFrame(self.all_phis, columns=[f'Feature {i}' for i in range(self.n_features)])
-    if self.feature_names is not None:
-        phi_df.columns = self.feature_names
-
-    feature_sums = phi_df.sum()
-    feature_sums_sorted = feature_sums.sort_values(ascending=False)
-    phi_df = phi_df[feature_sums_sorted.index]
-
-    feature_sums = phi_df.sum()
-    feature_sums_sorted = feature_sums.sort_values(ascending=False)
-    feature_sums_sorted = feature_sums_sorted.head(n_top)
-
-    plt.figure(figsize=(width, height))
-    plt.barh(feature_sums_sorted.index, feature_sums_sorted.values)
-    plt.title("FADEx Feature Importance Plot")
-    plt.xlabel("Importance Values")
-
-    plt.tick_params(
-        axis='y',          
-        which='both',     
-        labelsize=16
-    )
-    plt.xticks([])
-
-    
-    plt.gca().invert_yaxis()
-    plt.tight_layout()
-    # plt.savefig("synthetic_importance_ranking.svg", format="svg", dpi=300, bbox_inches='tight', pad_inches=0.1)
-
-    plt.show()
 
 class FADEx:
-    '''
-    Local explainability method for dimensionality reduction (DR) algorithms using Jacobian-based analysis.
 
-    Parameters
-    ----------
-    high_dim_data : np.ndarray, shape (n_samples, n_features)
-        The dataset in the original high-dimensional space.
+    def __init__(self, high_dim_data: np.ndarray, low_dim_data: np.ndarray,
+                 n_neighbors: int = None, feature_names: list = None,
+                 class_names: list = None, remove_const_feat: bool = True,
+                 use_pca: bool = True, ridge_lambda: float = 0.1,
+                 verbose: bool = False):
+        '''
+        Local explainability method for dimensionality reduction (DR) algorithms.
 
-    low_dim_data : np.ndarray, shape (n_samples, d)
-        The dataset in the low-dimensional space (embedding produced by the DR algorithm).
+        Parameters
+        ----------
+        high_dim_data : np.array, shape (n_samples, n_features)
+            The dataset in the original high-dimensional space.
 
-    n_neighbors : int, optional
-        Number of neighbors to consider for local explanations. If None, all points are used.
+        low_dim_data : np.array, shape (n_samples, reduced_dimension)
+            The dataset in the reduced dimension after transformation by DR algorithm.
+            If you want to visualize FADEx explanations, the reduced dimension must be 2.
 
-    feature_names : list of str, optional
-        Names of the original features. If None, generic names are used for plotting.
+        n_neighbors : int
+            Number of neighbors used in the Jacobian approximation. Recommended: 10% of
+            the dataset size.
 
-    class_names : list of str, optional
-        Names of the classes for each instance.
+        feature_names : list, optional
+            List with the feature names. If None, standard names (feature_0, feature_1, ...)
+            will be used.
 
-    RBF_kernel : str, default='cubic'
-        The kernel used by the RBFInterpolator.
+        class_names : list, optional, shape (n_samples,)
+            List with the class name for each instance. If None, class names won't be displayed.
 
-    pre_dr : int, optional
-        If not None, applies preliminary dimensionality reduction (PCA) to the high-dimensional data,
-        reducing it to `pre_dr` dimensions, before computing the h in the finite differences method.
+        remove_const_feat : bool, default=True
+            Removes near-constant features (variance < 1e-6) before computing the local
+            Jacobian. This helps deal with the curse of dimensionality.
 
-    RBF_epsilon : float, default=0.001
-        The epsilon parameter for the RBF kernel.
+        use_pca : bool, default=True
+            Applies PCA retaining 95% of variance before Jacobian estimation, further
+            reducing the effective dimensionality.
 
-    RBF_degree : float, default=1
-        The degree parameter for the RBF kernel.
+        ridge_lambda : float, default=0.1
+            Regularization strength for the weighted ridge least-squares Jacobian estimation.
 
-    RBF_smoothing : float, default=0
-        The smoothing parameter for the RBF kernel.
+        verbose : bool, default=False
+            If True, prints debug information during computation.
+        '''
 
-    use_GPU : bool, default=False
-        If True, uses GPU acceleration for computations.
-
-    dist_sample : int, optional
-        Number of samples to use for distance computation. If None, all data points are used.
-    '''
-        
-    def __init__(self, high_dim_data: np.ndarray, low_dim_data: np.ndarray, 
-                n_neighbors: int = None, feature_names: list = None, 
-                class_names: list = None, RBF_kernel: str = 'cubic',
-                pre_dr : int = None, RBF_epsilon : float = 0.001, 
-                RBF_degree : float = 1, RBF_smoothing : float = 0, 
-                use_GPU : bool = False, dist_sample : int = None):
-
+        # Hyperparameters
+        self.class_names = class_names
+        self.ridge_lambda = ridge_lambda
+        self.verbose = verbose
+        self.remove_const_feat = remove_const_feat
+        self.use_pca = use_pca
         self.n_neighbors = n_neighbors
-        self.class_names=class_names
-        self.RBF_kernel = RBF_kernel
-        self.all_phis = None
-        self.h = None
-        self.pre_dr = pre_dr
-        self.RBF_degree = RBF_degree
-        self.RBF_smoothing = RBF_smoothing
-        self.RBF_epsilon = RBF_epsilon
-        self.use_GPU = use_GPU
-        self.dist_sample = dist_sample
 
-        if(self.use_GPU and not GPU_availability):
-            raise ImportError("The GPU option has been selected, but the required libraries are not available. "
-            "Please install cupy and cuml or set use_GPU=False.")
-        elif(self.use_GPU and GPU_availability):
-            self.high_dim_data = cp.array(high_dim_data)
-            self.low_dim_data = cp.array(low_dim_data)
+        # Internal state — populated by _fit_all()
+        self.all_phis  = None
+        self.all_norms = None
+        self.all_jacs  = None
 
-            self.xp = cp
-            self.nbrs = CudaNearestNeighbors(n_neighbors=self.n_neighbors, metric='euclidean')
+        self.high_dim_data = np.array(high_dim_data)
+        self.low_dim_data  = np.array(low_dim_data)
 
-            if(self.pre_dr is not None):
-                self.pca = CudaPCA(n_components=self.pre_dr)
-
-        else:
-            self.high_dim_data = np.array(high_dim_data)
-            self.low_dim_data = np.array(low_dim_data)
-
-            self.xp = np
-            self.nbrs = NearestNeighbors(n_neighbors=self.n_neighbors, algorithm='ball_tree', n_jobs=2)
-
-            if(self.pre_dr is not None):
-                self.pca = PCA(n_components=self.pre_dr)
-
-        self.n_samples = len(self.high_dim_data)
+        self.n_samples  = len(self.high_dim_data)
         self.n_features = len(self.high_dim_data[0])
 
-        # Feature Names
-        if(feature_names is None):
-            num_features = self.high_dim_data.shape[1]
-            self.feature_names = [f"feature_{i}" for i in range(num_features)]
+        # Use generic labels when no feature names are provided
+        if feature_names is None:
+            self.feature_names = [f"feature_{i}" for i in range(self.n_features)]
         else:
             self.feature_names = feature_names
-    
-    def _compute_importance(self, jacobian, x):
-                
-        U, S, VT = self.xp.linalg.svd(jacobian, full_matrices=True)
+
+    # -----------------------------------------------------------------------
+    # Private helpers
+    # -----------------------------------------------------------------------
+
+    def _drop_const_features(
+        self,
+        high_dim_point: np.ndarray,
+        high_dim_nei: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        '''
+        Removes near-constant features from the local neighborhood to reduce
+        the effective dimensionality before Jacobian estimation.
+
+        Features whose variance across neighbors is below _VAR_THRESHOLD are
+        dropped, but at least _MIN_KEEP features (those with the highest variance)
+        are always retained.
+
+        Returns
+        -------
+        high_dim_point_f : filtered query point
+        high_dim_nei_f   : filtered neighborhood matrix
+        keep             : boolean mask over original features
+        kept_idx         : integer indices of kept features
+        '''
+        var  = np.var(high_dim_nei, axis=0)
+        keep = var > _VAR_THRESHOLD
+
+        # Guarantee a minimum number of features
+        if int(keep.sum()) < _MIN_KEEP:
+            top  = np.argsort(var)[-_MIN_KEEP:]
+            keep = np.zeros_like(var, dtype=np.bool_)
+            keep[top] = True
+
+        kept_idx        = np.where(keep)[0]
+        high_dim_nei_f  = high_dim_nei[:, kept_idx]
+        high_dim_point_f = high_dim_point[kept_idx]
+
+        return high_dim_point_f, high_dim_nei_f, keep, kept_idx
+
+    def _reinflate_jac(self, jac_filtered: np.ndarray, keep_mask: np.ndarray) -> np.ndarray:
+        '''
+        Expands a Jacobian computed on the reduced feature set back to the full
+        feature space, padding the dropped feature columns with zeros.
+        '''
+        keep_mask = np.asarray(keep_mask)
+        jac_full = np.zeros((jac_filtered.shape[0], self.n_features), dtype=jac_filtered.dtype)
+        jac_full[:, keep_mask] = jac_filtered
+        return jac_full
+
+    def _compute_importance(self, jacobian: np.ndarray, x: np.ndarray) -> np.ndarray:
+        '''
+        Derives per-feature importance scores from the Jacobian via SVD.
+
+        The importance of feature j is defined as:
+
+            phi_j = |v_{1j} * x_j| + (S[1] / S[0]) * |v_{2j} * x_j|
+
+        where v_{ij} is the j-th entry of the i-th right singular vector and
+        S[i] is the i-th singular value. The ratio S[1]/S[0] weights the second
+        singular direction by its relative contribution.
+        '''
+        _, S, VT = np.linalg.svd(jacobian, full_matrices=True)
         V = VT.T
 
-        phi = self.xp.zeros_like(x)  
-
-        n_singular_vectors = V.shape[1]
-        if n_singular_vectors < 2:
+        if V.shape[1] < 2:
             raise ValueError("Jacobian matrix does not have enough singular vectors.")
-        
-        
+
+        phi = np.zeros_like(x)
         for j in range(len(x)):
-            phi[j] = self.xp.abs(V[j, 0] * x[j]) + (S[1]/S[0])*self.xp.abs(V[j, 1] * x[j])
+            phi[j] = (np.abs(V[j, 0] * x[j])
+                      + (S[1] / (S[0] + _RIDGE_EPS)) * np.abs(V[j, 1] * x[j]))
+
+        if np.isnan(phi).any():
+            raise ValueError('NaN values computed for phi.')
 
         return phi
-    
-    def _nearest_neighbors(self, data, point, return_indices=False):
 
-        self.nbrs.fit(data)
-
-        distances, indices = self.nbrs.kneighbors(point.reshape(1, -1))
-
-        if return_indices:
-            return indices[0]
-        else:
-            return data[indices[0]]
-    
-    def _compute_distances_vec(self, data):
-        
-        num_points = len(data)
-        if num_points < 2:
-            raise ValueError('Not enough neighbors to compute distances.')
-
-        # Pre DR
-        if(self.pre_dr is not None):
-            data = self.pca.fit_transform(data)
-
-        # Min Distance Computing
-
-        if(self.dist_sample is not None):
-            indices = self.xp.random.choice(data.shape[0], size=self.dist_sample, replace=False)
-            sampled_data = data[indices]
-            distances = self.xp.linalg.norm(sampled_data[:, None, :] - sampled_data[None, :, :], axis=-1)
-            min_distance = self.xp.min(distances[distances > 0])
-        else:
-            distances = self.xp.linalg.norm(data[:, None, :] - data[None, :, :], axis=-1)
-            min_distance = self.xp.min(distances[distances > 0])
-
-    
-        # Distance Adjustment
-        D = data.shape[1]
-
-        return (1 / self.xp.sqrt(D)) * min_distance
-
-    def _compute_jac_vec(self, high_dim_point, low_dim_point, high_dim_nei, low_dim_nei, batch_size):
-
-        if(self.use_GPU):
-
-            jac = cp.zeros((len(low_dim_point), len(high_dim_point)), dtype=cp.float32)  
-            x = high_dim_point
-
-            num_batches = (len(low_dim_point) + batch_size - 1) // batch_size
-
-            # For each line 
-            for i in range(len(low_dim_point)):
-
-                # Calculating columns in batches
-                for batch in range(num_batches):
-                    start = batch * batch_size
-                    end = min((batch + 1) * batch_size, len(high_dim_nei))
-
-                    # Creating a batch interpolator (OLHAR ISSO AQUI DEPOIS)
-                    rbf = CudaRBFInterpolator(
-                        cp.asarray(high_dim_nei[start:end], dtype=cp.float32),
-                        cp.asarray(low_dim_nei[start:end, i].reshape(-1, 1), dtype=cp.float32),
-                        kernel=self.RBF_kernel, 
-                        epsilon=self.RBF_epsilon, 
-                        degree=self.RBF_degree, 
-                        smoothing=self.RBF_smoothing
-                    )
-
-                    x_plus_list = []
-                    x_minus_list = []
-
-                    # Making disturbances
-                    for j in range(len(high_dim_point)):
-                        x_plus = x.copy()
-                        x_minus = x.copy()
-                        
-                        x_plus[j]  += self.h
-                        x_minus[j] -= self.h
-                        
-                        x_plus_list.append(x_plus)
-                        x_minus_list.append(x_minus)
-
-                    x_plus_batch  = cp.stack(x_plus_list, axis=0) 
-                    x_minus_batch = cp.stack(x_minus_list, axis=0) 
-
-                    # Evaluating the function
-                    f_plus_batch  = rbf(x_plus_batch) 
-                    f_minus_batch = rbf(x_minus_batch)  
-
-                    # Computing the derivative
-                    for j in range(len(high_dim_point)):
-                        derivative_j = (f_plus_batch[j] - f_minus_batch[j]) / (2 * self.h)
-                        jac[i, j] = derivative_j
-
-            return jac
-
-        else:
-
-            jac = np.zeros((len(low_dim_point), len(high_dim_point)))
-            x = high_dim_point
-
-            # For each line
-            for i in range(len(low_dim_point)):
-                rbf = RBFInterpolator(
-                    high_dim_nei, 
-                    low_dim_nei[:, i].reshape(-1, 1),
-                    kernel=self.RBF_kernel,
-                    epsilon=self.RBF_epsilon,
-                    degree=self.RBF_degree,
-                    smoothing=self.RBF_smoothing
-                )
-
-                x_plus_array = []
-                x_minus_array = []
-
-                # Computing columns in batches
-                for j in range(len(high_dim_point)):
-                    x_plus = x.copy()
-                    x_plus[j] += self.h
-
-                    x_minus = x.copy()
-                    x_minus[j] -= self.h
-
-                    x_plus_array.append(x_plus)
-                    x_minus_array.append(x_minus)
-
-                x_plus_array = np.array(x_plus_array)
-                x_minus_array = np.array(x_minus_array)
-
-                f_plus = rbf(x_plus_array)  
-                f_minus = rbf(x_minus_array)
-
-                for j in range(len(high_dim_point)):
-                    derivative_j = (f_plus[j] - f_minus[j]) / (2 * self.h)
-                    jac[i, j] = derivative_j
-
-            return jac
-
-
-    def fit(self, explain_index : int, show : bool = True, width : int = 10, height : int = 8, batch_size : int = 200, n_top : int = 10):
+    def _nearest_neighbors(
+        self, data: np.ndarray, point: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
         '''
-        Computes the feature importance for a specific instance in the dataset.
+        Returns the distances and indices of the k nearest neighbors of `point`
+        within `data` using a ball-tree structure.
+        '''
+        nbrs = NearestNeighbors(n_neighbors=self.n_neighbors, algorithm='ball_tree', n_jobs=_N_JOBS)
+        nbrs.fit(data)
+        dist, indices = nbrs.kneighbors(point.reshape(1, -1))
+        return dist, indices
+
+    @staticmethod
+    def _ridge_wls(X: np.ndarray, Y: np.ndarray, w: np.ndarray, lam: float) -> np.ndarray:
+        '''
+        Solves the weighted ridge least-squares problem:
+
+            argmin_B  sum_i w_i * ||X_i B - Y_i||^2 + lam * ||B||^2
+
+        First attempts a direct solve via the normal equations. Falls back to a
+        robust augmented-system formulation if the matrix is singular.
+
+        Returns B of shape (p, d).
+        '''
+        p  = X.shape[1]
+        Xw = X * w[:, None]                      # (k, p)
+        A  = X.T @ Xw + lam * np.eye(p)          # (p, p)
+        B  = X.T @ (Y * w[:, None])              # (p, d)
+
+        try:
+            return np.linalg.solve(A, B)
+        except np.linalg.LinAlgError:
+            # Robust fallback: equivalent ridge via augmented system
+            sw    = np.sqrt(w)
+            X1    = X * sw[:, None]
+            Y1    = Y * sw[:, None]
+            X_aug = np.vstack([X1, np.sqrt(lam) * np.eye(p)])
+            Y_aug = np.vstack([Y1, np.zeros((p, Y.shape[1]))])
+            Bt, *_ = np.linalg.lstsq(X_aug, Y_aug, rcond=None)
+            return Bt
+
+    def _compute_jac_ls(
+        self,
+        high_dim_point: np.ndarray,
+        low_dim_point: np.ndarray,
+        high_dim_nei: np.ndarray,
+        low_dim_nei: np.ndarray,
+    ) -> np.ndarray:
+        '''
+        Estimates the Jacobian of the DR mapping at `high_dim_point` using
+        locally-weighted ridge least squares.
+
+        Local displacement vectors delta_X = X_neighbors - x and
+        delta_Y = Y_neighbors - y form the regression problem:
+
+            delta_Y ≈ delta_X @ B
+
+        where B.T is the Jacobian J of shape (d, D).
+
+        Neighbors closer to the query point receive higher weight via a
+        Gaussian kernel with bandwidth equal to the median neighbor distance.
+
+        Returns
+        -------
+        J : np.ndarray, shape (d, D)
+        '''
+        x  = np.asarray(high_dim_point, dtype=np.float64).ravel()   # (D,)
+        y  = np.asarray(low_dim_point,  dtype=np.float64).ravel()   # (d,)
+        Xn = np.asarray(high_dim_nei,   dtype=np.float64)           # (k, D)
+        Yn = np.asarray(low_dim_nei,    dtype=np.float64)           # (k, d)
+
+        # Input validation
+        if Xn.ndim != 2:
+            raise ValueError(f"high_dim_nei must be 2D (k, D). Got shape={Xn.shape}")
+        if Yn.ndim == 1:
+            Yn = Yn.reshape(-1, 1)
+        if Yn.ndim != 2:
+            raise ValueError(f"low_dim_nei must be 2D (k, d). Got shape={Yn.shape}")
+        if Xn.shape[0] != Yn.shape[0]:
+            raise ValueError(f"Neighbor count mismatch: Xn={Xn.shape}, Yn={Yn.shape}")
+        if Xn.shape[0] < 2:
+            raise ValueError("Not enough neighbors to estimate Jacobian via LS (need at least 2).")
+
+        # Local displacements centered at the query point
+        delta_X = Xn - x[None, :]   # (k, D)
+        delta_Y = Yn - y[None, :]   # (k, d)
+
+        # Gaussian distance weights — closer neighbors contribute more
+        distances          = np.linalg.norm(delta_X, axis=1)                            # (k,)
+        positive_distances = distances[distances > 0]
+        sigma              = float(max(
+            np.median(positive_distances) if positive_distances.size > 0 else 1.0,
+            _RIDGE_EPS
+        ))
+        weights = np.exp(-(distances ** 2) / (_SIGMA_FACTOR * sigma ** 2))             # (k,)
+
+        # Solve the weighted ridge system and transpose to Jacobian shape
+        Bt = self._ridge_wls(delta_X, delta_Y, weights, self.ridge_lambda)  # (D, d)
+        J  = Bt.T.astype(np.float64)                                         # (d, D)
+        return J
+
+    def _get_top_features(
+        self, phi: np.ndarray, n_top: int
+    ) -> Tuple[np.ndarray, List[str]]:
+        '''
+        Returns the indices and names of the top-n features sorted by
+        descending absolute importance score.
+        '''
+        top_indices = np.argsort(np.abs(phi))[::-1][:n_top]
+        top_names   = [self.feature_names[i] for i in top_indices]
+        return top_indices, top_names
+
+    def _get_jacobian(self, idx: int) -> np.ndarray:
+        '''
+        Returns the Jacobian for instance `idx`. Uses the cached value from
+        _fit_all() if available; otherwise calls fit() on the fly.
+        '''
+        if self.all_jacs is not None:
+            return self.all_jacs[idx]
+        return self.fit(idx, show=False)['jac']
+
+    def _resolve_feature(self, feature) -> Tuple[int, str]:
+        '''
+        Maps a feature identifier (name string or integer index) to its
+        (index, name) pair. Raises informative errors for invalid inputs.
+        '''
+        feature_names_list = list(self.feature_names)
+
+        if isinstance(feature, str):
+            if feature not in feature_names_list:
+                raise ValueError(f"Feature '{feature}' not found in feature_names.")
+            return feature_names_list.index(feature), feature
+
+        elif isinstance(feature, (int, np.integer)):
+            if not (0 <= feature < self.n_features):
+                raise ValueError(f"Feature index {feature} is out of bounds.")
+            return int(feature), feature_names_list[int(feature)]
+
+        else:
+            raise TypeError("Feature must be a string or integer.")
+
+    def _configure_clean_axes(self, ax) -> None:
+        '''
+        Removes all ticks, tick labels, and spines from a matplotlib Axes,
+        producing a clean embedding plot with no decorations.
+        '''
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    def _compute_vector_color_and_scale(
+        self,
+        norm: float,
+        vec: np.ndarray,
+        max_norm: float,
+        cmap,
+        vec_mult: float,
+    ) -> Tuple:
+        '''
+        Computes the display color and scaled arrow vector for a grid cell based
+        on the vector's magnitude norm:
+
+        - norm < 1  : plotted at natural scale with the lowest colormap color
+                      (no distortion signal).
+        - norm >= 1 : capped to unit length; color maps linearly from the lowest
+                      color (norm=1) to the highest (norm=max_norm).
+
+        Returns
+        -------
+        color    : RGBA tuple from the colormap
+        plot_vec : scaled vector to display
+        '''
+        if norm < 1.0:
+            color    = cmap(0.0)
+            plot_vec = vec_mult * vec
+        else:
+            # Cap length to 1 and map excess magnitude to colormap range [0, 1]
+            plot_vec  = vec_mult * (vec / norm)
+            color_val = (norm - 1.0) / (max_norm - 1.0) if max_norm > 1.0 else 0.0
+            color     = cmap(color_val)
+
+        return color, plot_vec
+
+    # -----------------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------------
+
+    def fit(self, explain_index: int, show: bool = True, width: int = 10,
+            height: int = 8, n_top: int = 10, save_fig: bool = False) -> dict:
+        '''
+        Computes the FADEx explanation for a single instance.
+
+        Steps:
+          1. Retrieve the local neighborhood.
+          2. Optionally filter near-constant features and apply PCA.
+          3. Estimate the Jacobian via weighted ridge least squares.
+          4. Derive per-feature importance scores through SVD of the Jacobian.
+          5. Compute the spectral norm as a local distortion measure.
 
         Parameters
         ----------
         explain_index : int
-            The index of the instance to explain.
-
+            Index of the instance to explain.
         show : bool, default=True
-            If True, displays the explanation plot.
-
-        width : int, default=8
-            The width of the plot.
-
-        height : int, default=10
-            The height of the plot.
-        
-        batch_size : int, default=200
-            Batch size for the Jacobian computation.
-        
+            If True, displays the feature importance bar chart.
+        width, height : int
+            Figure dimensions in inches.
         n_top : int
-            Number of top features to be plotted.
+            Number of top features to display.
+        save_fig : bool, default=False
+            If True, saves the plot as a PDF.
 
         Returns
         -------
-        phi : np.ndarray or cp.ndarray, shape (n_features,)
-            The importance values for each feature.
-
-        spectral_norm : float
-            The spectral norm of the Jacobian matrix.
+        dict with keys:
+            "phi"               — importance scores, shape (n_features,)
+            "spectral_norm"     — spectral norm of the Jacobian (float)
+            "jac"               — full Jacobian, shape (d, n_features)
+            "feature_names_top" — names of the top-n features
         '''
+        high_dim_point = self.high_dim_data[explain_index]   # (D,)
+        low_dim_point  = self.low_dim_data[explain_index]    # (d,)
 
-        high_dim_point = self.high_dim_data[explain_index]
-        low_dim_point = self.low_dim_data[explain_index]
+        # --- Neighborhood selection ---
+        if self.n_neighbors is None:
+            high_dim_nei = self.high_dim_data
+            low_dim_nei  = self.low_dim_data
+        else:
+            _, indices   = self._nearest_neighbors(data=self.high_dim_data, point=high_dim_point)
+            idx          = indices[0] if indices.ndim == 2 else indices
+            high_dim_nei = self.high_dim_data[idx]
+            low_dim_nei  = self.low_dim_data[idx]
 
+        # Store the original point before any preprocessing
+        x0 = high_dim_point
 
-        # Nearest Neighbors
-        if(self.n_neighbors is not None):
-            indices = self._nearest_neighbors(
-                data=self.high_dim_data, 
-                point=high_dim_point, 
-                return_indices=True
+        # --- Dimensionality reduction preprocessing ---
+        if self.remove_const_feat:
+            high_dim_point, high_dim_nei, keep_mask, _ = self._drop_const_features(
+                high_dim_point, high_dim_nei
+            )
+        if self.use_pca:
+            pca          = PCA(n_components=0.95, svd_solver='full')
+            high_dim_nei = pca.fit_transform(high_dim_nei)
+            high_dim_point = pca.transform(high_dim_point[None, :])[0]
+
+        # --- Jacobian estimation ---
+        jac = self._compute_jac_ls(high_dim_point, low_dim_point, high_dim_nei, low_dim_nei)
+
+        # Validate and sanitize
+        if np.any(np.isnan(jac)):
+            raise ValueError('NaN values computed for Jacobian.')
+        if np.any(np.isinf(jac)):
+            warnings.warn('Inf values computed for Jacobian. Turning them into 0 or max...')
+        jac = np.nan_to_num(jac)
+        jac = jac.astype(np.float32)
+
+        # --- Restore full feature space ---
+        if self.use_pca:
+            jac = jac @ pca.components_
+        if self.remove_const_feat:
+            jac = self._reinflate_jac(jac, keep_mask)
+
+        # --- Importance and distortion ---
+        phi           = self._compute_importance(jac, x0)
+        spectral_norm = np.linalg.norm(jac, ord=2)
+
+        if np.isnan(spectral_norm):
+            raise ValueError("Spectral Norm is NaN.")
+
+        # --- Top features ---
+        _, feature_names_top = self._get_top_features(phi, n_top)
+
+        if show:
+            self._explanation_plot(phi, spectral_norm, explain_index,
+                                   feature_names_top, width, height, n_top, save_fig)
+
+        return {
+            "phi":               phi,
+            "spectral_norm":     spectral_norm,
+            "jac":               jac,
+            "feature_names_top": feature_names_top,
+        }
+
+    def _fit_all(self) -> None:
+        '''
+        Runs fit() on every instance and caches results in self.all_phis,
+        self.all_norms, and self.all_jacs.
+
+        Called automatically by interactive_plot(), importance_plot(),
+        plot_feature_heatmap(), and plot_grid_feature_vectors() when cached
+        results are not yet available.
+        '''
+        results = [
+            self.fit(i, show=False)
+            for i in tqdm(range(self.n_samples), desc="Processing instances", unit="instance")
+        ]
+
+        self.all_phis  = np.asarray([r["phi"]          for r in results])
+        self.all_norms = np.asarray([r["spectral_norm"] for r in results])
+        self.all_jacs  = np.asarray([r["jac"]          for r in results])
+
+    def fit_cluster(self, cluster_ids: np.ndarray, n_top: int = 10,
+                    show: bool = False, save_fig: bool = False) -> Tuple[np.ndarray, List[str]]:
+        '''
+        Computes a cluster-level feature importance by averaging phi over all
+        instances in `cluster_ids`.
+
+        Parameters
+        ----------
+        cluster_ids : array-like of int
+            Indices of the instances belonging to the cluster.
+        n_top : int
+            Number of top features to return and optionally display.
+        show : bool, default=False
+            If True, displays the aggregated feature importance bar chart.
+        save_fig : bool, default=False
+            If True, saves the plot as a PDF.
+
+        Returns
+        -------
+        phi_cluster : np.ndarray, shape (n_features,)
+            Averaged importance scores over the cluster.
+        feature_names_top : list of str
+            Names of the top-n features.
+        '''
+        phi_cluster = np.zeros(shape=self.n_features)
+
+        for idx in tqdm(cluster_ids):
+            phi_cluster += self.fit(idx, show=False, n_top=n_top)["phi"]
+
+        # Normalize by cluster size
+        phi_cluster /= len(cluster_ids)
+
+        _, feature_names_top = self._get_top_features(phi_cluster, n_top)
+
+        if show:
+            self._explanation_plot(phi_cluster, spectral_norm=None, explain_index=None,
+                                   feature_names_top=feature_names_top, n_top=n_top,
+                                   save_fig=save_fig)
+
+        return phi_cluster, feature_names_top
+
+    def interactive_plot(self, width: int = 10, height: int = 8) -> None:
+        '''
+        Generates an interactive Plotly scatter plot of the 2D embedding.
+
+        Each point is colored by its spectral norm and has a hover tooltip
+        showing sorted feature importances. Calls _fit_all() automatically
+        if results are not yet cached.
+        '''
+        if self.all_phis is None:
+            self._fit_all()
+
+        width_px  = width  * 100
+        height_px = height * 100
+
+        # Build hover tooltip for each instance
+        formatted_text = []
+        for i, phi_row in enumerate(self.all_phis):
+
+            # Sort features by absolute importance (descending)
+            sorted_features = sorted(
+                zip(self.feature_names, phi_row),
+                key=lambda x: abs(x[1]),
+                reverse=True,
+            )
+            features_str = "<br>".join(f"{name}: {val:.3f}" for name, val in sorted_features)
+
+            # Optional class label prefix
+            class_str = ""
+            if self.class_names is not None:
+                class_str = f"Class: {self.class_names[i]}<br>"
+
+            norm_str = f"Spectral Norm: {self.all_norms[i]:.3f}"
+            formatted_text.append(f"{class_str}ID: {i}<br>{norm_str}<br><br>{features_str}")
+
+        # Color points by spectral norm value
+        norms = np.asarray(self.all_norms, dtype=float)
+
+        fig = go.Figure(data=go.Scatter(
+            x=self.low_dim_data[:, 0],
+            y=self.low_dim_data[:, 1],
+            mode='markers',
+            marker=dict(
+                size=_MARKER_SIZE,
+                color=norms,
+                colorscale=_COLORSCALE,
+                reversescale=True,
+                cmin=float(np.min(norms)),
+                cmax=float(np.max(norms)),
+                showscale=True,
+            ),
+            text=formatted_text,
+            hovertemplate='%{text}<extra></extra>',
+        ))
+
+        fig.update_layout(
+            title=f"Interactive Plot | Mean Spectral Norm: {np.mean(norms):.3f}",
+            hovermode='closest',
+            width=width_px,
+            height=height_px,
+        )
+        fig.update_xaxes(showgrid=False, showticklabels=False, ticks='')
+        fig.update_yaxes(showgrid=False, showticklabels=False, ticks='')
+        fig.show()
+
+    def importance_plot(self, width: int = 8, height: int = 8,
+                        n_top: int = 10, save_fig: bool = False) -> None:
+        '''
+        Plots a global feature importance ranking by summing phi across all
+        instances. Calls _fit_all() automatically if needed.
+
+        Parameters
+        ----------
+        width, height : int
+            Figure dimensions in inches.
+        n_top : int
+            Number of top features to display.
+        save_fig : bool, default=False
+            If True, saves the plot as a PDF.
+        '''
+        if self.all_phis is None:
+            self._fit_all()
+
+        # Sum importance across instances, sort, and pick top-n
+        phi_df = pd.DataFrame(self.all_phis, columns=self.feature_names)
+        feature_sums_sorted = phi_df.sum().sort_values(ascending=False).head(n_top)
+
+        plt.figure(figsize=(width, height))
+        plt.barh(feature_sums_sorted.index, feature_sums_sorted.values)
+        plt.tick_params(axis='y', which='both', labelsize=_LABEL_FONTSIZE)
+        plt.xticks([])
+        plt.gca().invert_yaxis()
+        plt.tight_layout()
+
+        if save_fig:
+            plt.savefig("FADEx_importance_plot.pdf", format="pdf")
+
+        plt.show()
+
+    def _explanation_plot(self, phi: np.ndarray, spectral_norm: Optional[float],
+                          explain_index: Optional[int], feature_names_top: List[str],
+                          width: int = 4, height: int = 4,
+                          n_top: int = 10, save_fig: bool = False) -> List[str]:
+        '''
+        Plots a horizontal bar chart of per-feature importance for a single
+        instance or a cluster aggregate.
+
+        Bars are colored green (positive) or red (negative). The title includes
+        the spectral norm when available.
+        '''
+        # Extract the top-n phi values in importance-descending order
+        top_indices = np.argsort(np.abs(phi))[::-1][:n_top]
+        phi_top     = phi[top_indices]
+
+        plt.figure(figsize=(width, height))
+        y_pos  = np.arange(len(phi_top))
+        colors = ['red' if val < 0 else 'green' for val in phi_top]
+
+        plt.barh(y_pos, phi_top, color=colors)
+        plt.yticks(y_pos, feature_names_top, fontsize=12)
+        plt.xticks([])
+        plt.gca().invert_yaxis()
+        plt.axvline(x=0, color='black', linewidth=1)
+
+        # Build title depending on context (single instance vs. cluster)
+        title = (f"Feature Importance for instance {explain_index}"
+                 if explain_index is not None
+                 else "Cluster Feature Importance")
+        if spectral_norm is not None:
+            title += f" (spectral norm = {spectral_norm:.3f})"
+        plt.title(title)
+
+        plt.tight_layout()
+        if save_fig:
+            plt.savefig(f'explanation_plot_instance_{explain_index}_top_{n_top}.pdf')
+
+        plt.show()
+        return feature_names_top
+
+    def plot_grid_feature_vectors(self, features_to_plot: list, labels=None,
+                                  mask=None, grid_bins: int = 15, min_points: int = 1,
+                                  scale_factor: float = 1.0, width: int = 12,
+                                  height: int = 10, save: bool = False) -> None:
+        """
+        Overlays Jacobian-based feature vectors on the 2D embedding using a grid.
+
+        The embedding plane is divided into a (grid_bins × grid_bins) grid. For
+        each occupied cell the mean Jacobian is computed and the selected feature
+        columns are drawn as arrows. Arrow color encodes magnitude:
+
+        - norm < 1  : minimum colormap color (no noteworthy distortion).
+        - norm >= 1 : length capped to 1, color scales with excess magnitude.
+
+        Parameters
+        ----------
+        features_to_plot : list of str or int
+            Features to visualize (by name or index). Duplicates are removed.
+        labels : array-like, optional
+            Class labels for background scatter coloring.
+        mask : array-like of bool, optional
+            Boolean mask to highlight a subset of points.
+        grid_bins : int, default=15
+            Number of bins along each axis of the grid.
+        min_points : int, default=1
+            Minimum points required in a cell before drawing vectors.
+        scale_factor : float, default=1.0
+            Additional multiplier applied to vector magnitudes.
+        width, height : int
+            Figure dimensions in inches.
+        save : bool, default=False
+            If True, saves the plot as a PDF.
+        """
+
+        # --- Feature validation: map names/indices to column indices ---
+        feature_indices = list(dict.fromkeys(
+            self._resolve_feature(f)[0] for f in features_to_plot
+        ))
+
+        # --- Build 2D grid over the embedding ---
+        x_data = self.low_dim_data[:, 0]
+        y_data = self.low_dim_data[:, 1]
+
+        x_margin = (x_data.max() - x_data.min()) * 0.05
+        y_margin = (y_data.max() - y_data.min()) * 0.05
+
+        x_bins = np.linspace(x_data.min() - x_margin, x_data.max() + x_margin, grid_bins + 1)
+        y_bins = np.linspace(y_data.min() - y_margin, y_data.max() + y_margin, grid_bins + 1)
+
+        # Assign each point to its grid cell
+        x_indices = np.digitize(x_data, x_bins) - 1
+        y_indices = np.digitize(y_data, y_bins) - 1
+
+        # --- Background scatter ---
+        fig, ax = plt.subplots(figsize=(width, height))
+
+        if labels is not None:
+            num_classes   = len(np.unique(labels))
+            discrete_cmap = plt.get_cmap('Pastel1', num_classes)
+            if mask is not None:
+                mask = np.array(mask, dtype=bool)
+                # Unmasked points in gray, masked (highlighted) points on top
+                ax.scatter(x_data[~mask], y_data[~mask], color='lightgray',
+                           s=30, alpha=0.3, edgecolors='none', zorder=1)
+                ax.scatter(x_data[mask], y_data[mask], c=labels[mask],
+                           cmap=discrete_cmap, s=30, alpha=0.9, edgecolors='none', zorder=2)
+            else:
+                ax.scatter(x_data, y_data, c=labels, cmap=discrete_cmap,
+                           s=30, alpha=0.75, edgecolors='none', zorder=1)
+        else:
+            ax.scatter(x_data, y_data, s=30, color='lightgray',
+                       alpha=0.75, edgecolors='none', zorder=1)
+
+        # --- Collect occupied cells and their point indices ---
+        valid_cells = []
+        for i in range(grid_bins):
+            for j in range(grid_bins):
+                pts_in_cell = np.where((x_indices == i) & (y_indices == j))[0]
+                if len(pts_in_cell) >= min_points:
+                    valid_cells.append((i, j, pts_in_cell))
+
+        # --- Compute mean Jacobian per cell and collect arrow data ---
+        vectors_data = []
+        max_norm     = 1.0   # Floor value prevents division by zero in color mapping
+
+        for i, j, pts_idx in tqdm(valid_cells, desc="Computing grid cells"):
+            cx = (x_bins[i] + x_bins[i + 1]) / 2.0
+            cy = (y_bins[j] + y_bins[j + 1]) / 2.0
+
+            # Average Jacobian over all points in the cell
+            mean_jac = np.mean([self._get_jacobian(idx) for idx in pts_idx], axis=0)
+
+            for feat_idx in feature_indices:
+                vec  = mean_jac[:, feat_idx] * scale_factor
+                norm = np.linalg.norm(vec)
+                if norm > max_norm:
+                    max_norm = norm
+                vectors_data.append({'cx': cx, 'cy': cy, 'vec': vec, 'norm': norm})
+
+        # --- Draw arrows with magnitude-based coloring ---
+        cmap     = plt.get_cmap('plasma_r')
+        vec_mult = _VEC_SCALE * (x_data.max() - x_data.min()) / grid_bins
+
+        for data in vectors_data:
+            cx, cy = data['cx'], data['cy']
+            color, plot_vec = self._compute_vector_color_and_scale(
+                data['norm'], data['vec'], max_norm, cmap, vec_mult
+            )
+            ax.annotate(
+                "",
+                xy=(cx + plot_vec[0], cy + plot_vec[1]),
+                xytext=(cx, cy),
+                arrowprops=dict(
+                    arrowstyle="simple, tail_width=1.0, head_width=1.4, head_length=1.4",
+                    facecolor=color,
+                    edgecolor='black',
+                    linewidth=1.0,
+                    alpha=1.0,
+                ),
+                zorder=4,
             )
 
-            low_dim_nei = self.low_dim_data[indices]
-            high_dim_nei = self.high_dim_data[indices]
-        else:
-            low_dim_nei = self.low_dim_data
-            high_dim_nei = self.high_dim_data
+        # --- Colorbar (only when vectors exceed unit length) ---
+        if max_norm > 1.0:
+            norm_cb = mcolors.Normalize(vmin=1.0, vmax=max_norm)
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm_cb)
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("Original vector magnitude (capped at 1)", rotation=270, labelpad=15)
 
-        # Distance Computing
-        if(self.h is None):
-            self.h = self._compute_distances_vec(self.high_dim_data)
+        # Title shows up to 3 feature names with ellipsis if more
+        title_feats = [self.feature_names[i] for i in feature_indices[:3]]
+        features_str = ", ".join(title_feats) + ("..." if len(feature_indices) > 3 else "")
+        ax.set_title(f"Vector Field: {features_str}", fontsize=14)
+        ax.axis('equal')
 
-        # Jacobian Computing
-        jac = self._compute_jac_vec(
-            high_dim_point,
-            low_dim_point,
-            high_dim_nei,
-            low_dim_nei,
-            batch_size
+        self._configure_clean_axes(ax)
+        plt.tight_layout()
+        if save:
+            plt.savefig(f'feature_vectors_{features_to_plot}.pdf')
+        plt.show()
+
+    def plot_feature_heatmap(self, feature, gridsize: int = 30, cmap: str = 'magma',
+                             width: int = 10, height: int = 8, save: bool = False) -> None:
+        """
+        Renders a hexbin heatmap on the 2D embedding showing where a specific
+        feature has the highest importance (phi value).
+
+        The figure background is set to the darkest tone of the colormap for
+        contrast, and real data points are shown as faint white dots to provide
+        spatial context. Calls _fit_all() automatically if needed.
+
+        Parameters
+        ----------
+        feature : str or int
+            The feature to visualize (by name or index).
+        gridsize : int, default=30
+            Hexbin resolution (number of hexagons across the x-axis).
+        cmap : str, default='magma'
+            Matplotlib colormap name.
+        width, height : int
+            Figure dimensions in inches.
+        save : bool, default=False
+            If True, saves the plot as a PDF.
+        """
+        # --- Feature validation ---
+        feature_idx, feature_name = self._resolve_feature(feature)
+
+        # --- Ensure all phis are computed ---
+        if self.all_phis is None:
+            self._fit_all()
+
+        x_data     = self.low_dim_data[:, 0]
+        y_data     = self.low_dim_data[:, 1]
+        phi_values = np.abs(np.asarray(self.all_phis)[:, feature_idx])
+
+        # --- Figure with dark background matching the colormap's lowest tone ---
+        colormap = plt.get_cmap(cmap)
+        bg_color = colormap(0.0)
+
+        fig, ax = plt.subplots(figsize=(width, height))
+        fig.patch.set_facecolor(bg_color)
+        ax.set_facecolor(bg_color)
+
+        # Faint white dots for spatial context
+        ax.scatter(x_data, y_data, s=10, color='white', alpha=0.10, edgecolors='none', zorder=1)
+
+        # --- Hexbin heatmap: each cell shows the mean phi of its points ---
+        hb = ax.hexbin(
+            x_data, y_data,
+            C=phi_values,
+            gridsize=gridsize,
+            cmap=cmap,
+            reduce_C_function=np.mean,
+            alpha=1.0,
+            edgecolors='none',
+            mincnt=1,
+            zorder=2,
         )
 
-        # Importance Computing
-        phi = self._compute_importance(jac, high_dim_point)
+        # --- Colorbar with white labels to contrast against the dark background ---
+        cbar = fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Mean Importance (Phi)", rotation=270, labelpad=15, color='white')
+        cbar.ax.yaxis.set_tick_params(color='white', labelcolor='white')
 
-        # Spectral Norm
-        spectral_norm = self.xp.linalg.norm(jac, ord=2)
+        ax.set_title(f"Feature Importance Heatmap: {feature_name}", fontsize=14, color='white')
+        ax.axis('equal')
 
-        if(np.isnan(spectral_norm)):
-            raise ValueError("Spectral Norm is NaN.")
-        
+        self._configure_clean_axes(ax)
+        plt.tight_layout()
 
-        if(show):
-            _explanation_plot(self, phi, spectral_norm, explain_index, width, height, n_top)
-                
+        if save:
+            safe_name = str(feature_name).replace("/", "_").replace(" ", "_")
+            plt.savefig(f'heatmap_importance_{safe_name}.pdf',
+                        facecolor=fig.get_facecolor(), transparent=False)
 
-
-        return phi, spectral_norm
-    
-
-    # Auxiliary function for parallelism
-    def _compute_phi(self, i):
-        phi, spec_norm = self.fit(i, show=False)
-        return phi, spec_norm
-    
-    # Applies fit function in the entire dataset
-    def _fit_all(self):
-        results = [self._compute_phi(i) for i in tqdm(range(self.n_samples), desc="Processing samples", unit="sample")]
-
-        all_phis, all_norms = zip(*results)
-        self.all_phis = np.array([arr.get() if GPU_availability and isinstance(arr, cp.ndarray) else arr for arr in all_phis])
-        self.all_norms = np.array([arr.get() if GPU_availability and isinstance(arr, cp.ndarray) else arr for arr in all_norms])
-
-
-
-    def interactive_plot(self, width : int = 10, height : int =8):
-        '''
-        Generates an interactive plot that shows the feature importance for every instance.
-
-        Parameters
-        ----------
-        width : int, optional
-            The width of the plot.
-
-        height : int, optional
-            The height of the plot.
-
-        '''
-
-        if(self.all_phis is None):
-            self._fit_all()
-
-        _interactive_plot(self, width, height)
-
-    def importance_plot(self, width : int = 10, height : int = 8, n_top : int = 10):
-        '''
-        Generates a plot of feature importance for all instances.
-
-        Parameters
-        ----------
-        width : int, optional
-            The width of the plot.
-
-        height : int, optional
-            The height of the plot.
-
-        n_top : int
-            Number of top features to be plotted.
-        '''
-
-        if(self.all_phis is None):
-            self._fit_all()
-
-
-        _importance_plot(self, width, height, n_top)
+        plt.show()

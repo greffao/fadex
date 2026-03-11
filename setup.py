@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="fadex-exp",
-    version="0.1.0",
+    version="0.2.0",
     author="Lucas Greff Meneses",
     author_email="lucasgreffmeneses@usp.br",
     description="A feature attribution explainability method for dimensionality reduction algorithms.",
@@ -28,10 +28,4 @@ setuptools.setup(
         "plotly",
         "tqdm"
     ],
-    extras_require={
-        "gpu": [
-            "cupy",
-            "cuml"
-        ]
-    }
 )
