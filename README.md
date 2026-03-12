@@ -25,13 +25,9 @@ The **spectral norm** of the Jacobian is used as a local distortion measure — 
 
 # Installation
 
-Install without GPU dependencies:
-
 ```bash
 pip install fadex-exp
 ```
-
-For **GPU acceleration**, install the [RAPIDS](https://rapids.ai/start.html) framework (`cupy` + `cuml`) following the official instructions.
 
 ---
 
@@ -168,7 +164,7 @@ fadex.interactive_plot(
 )
 ```
 
-Displays an interactive Plotly scatter plot of the 2D embedding. Points are colored by their spectral norm (lower = less distortion), and hovering over a point shows its feature importance breakdown:
+Displays an interactive Plotly scatter plot of the 2D embedding. Points are colored by their spectral norm, and hovering over a point shows its feature importance breakdown:
 
 ![interactive plot](https://raw.githubusercontent.com/greffao/fadex/main/figs/interactive.png)
 
