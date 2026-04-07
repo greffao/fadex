@@ -8,13 +8,13 @@ then derives per-feature importance scores from the SVD of the Jacobian.
 -------------------------------------------------------------------------------
 Author  : Lucas Greff Meneses
 Email   : lucasgreffmeneses@usp.br
-GitHub  : https://github.com/greffao/fadex
+GitHub  : https://github.com/greffao
 -------------------------------------------------------------------------------
 
 Notes
 -----
 - Requires scikit-learn, numpy, scipy, pandas, matplotlib, plotly, and tqdm.
-- The code was commented by Claude Code
+- The code was commented partially by Claude Code
 
 '''
 
@@ -29,11 +29,13 @@ from sklearn.decomposition import PCA
 # Plotting
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.cm as cm
 import plotly.graph_objects as go
+import colorsys
 
 # Utils
 from tqdm.auto import tqdm
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import warnings
 
 # ---------------------------------------------------------------------------
@@ -41,21 +43,42 @@ import warnings
 # ---------------------------------------------------------------------------
 _VAR_THRESHOLD  = 1e-6    # Minimum neighborhood variance to keep a feature
 _MIN_KEEP       = 5       # Minimum number of features kept after variance filtering
-_RIDGE_EPS      = 1e-12   # Small epsilon to avoid division by zero in SVD importance
-_N_JOBS         = 2       # Parallelism for NearestNeighbors
-_MARKER_SIZE    = 7       # Default marker size in the interactive plot
-_COLORSCALE     = 'viridis'  # Default colorscale for the interactive plot
-_LABEL_FONTSIZE = 16      # y-axis label font size in importance_plot
-_VEC_SCALE      = 0.8     # Fraction of a grid cell used as max vector length
-_SIGMA_FACTOR   = 2.0     # Denominator factor in Gaussian weights: exp(-r²/(SIGMA_FACTOR·σ²))
+_EPS            = 1e-12   # Small epsilon to avoid division by zero
+
+
+def _build_cmap(n=256, darken=0.90):
+    '''
+    Builds a customized colormap based on the Spectral_r standard colormap from
+    matplotlib.
+    '''
+    spectral = cm.get_cmap("Spectral_r", n)
+    dark_colors = []
+    for i in range(n):
+        r, g, b, a = spectral(i / (n - 1))
+        h, s, v = colorsys.rgb_to_hsv(r, g, b)
+        v *= darken
+        r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
+        dark_colors.append((r2, g2, b2, a))
+    return mcolors.LinearSegmentedColormap.from_list("spectral_r_dark", dark_colors)
+
+
+def _cmap_to_plotly(cmap, n=256):
+    """Convert matplotlib colormap to Plotly colorscale."""
+    return [
+        [i / (n - 1), mcolors.to_hex(cmap(i / (n - 1)))]
+        for i in range(n)
+    ]
+
+_CMAP = _build_cmap()
+_PLOTLY_CMAP = _cmap_to_plotly(_CMAP)
 
 
 class FADEx:
 
     def __init__(self, high_dim_data: np.ndarray, low_dim_data: np.ndarray,
                  n_neighbors: int = None, feature_names: list = None,
-                 class_names: list = None, remove_const_feat: bool = True,
-                 use_pca: bool = True, ridge_lambda: float = 0.1,
+                 class_names: list = None, remove_const_feat: bool = False,
+                 use_pca: bool = False, ridge_lambda: float = 0.1,
                  verbose: bool = False):
         '''
         Local explainability method for dimensionality reduction (DR) algorithms.
@@ -172,14 +195,6 @@ class FADEx:
     def _compute_importance(self, jacobian: np.ndarray, x: np.ndarray) -> np.ndarray:
         '''
         Derives per-feature importance scores from the Jacobian via SVD.
-
-        The importance of feature j is defined as:
-
-            phi_j = |v_{1j} * x_j| + (S[1] / S[0]) * |v_{2j} * x_j|
-
-        where v_{ij} is the j-th entry of the i-th right singular vector and
-        S[i] is the i-th singular value. The ratio S[1]/S[0] weights the second
-        singular direction by its relative contribution.
         '''
         _, S, VT = np.linalg.svd(jacobian, full_matrices=True)
         V = VT.T
@@ -190,7 +205,7 @@ class FADEx:
         phi = np.zeros_like(x)
         for j in range(len(x)):
             phi[j] = (np.abs(V[j, 0] * x[j])
-                      + (S[1] / (S[0] + _RIDGE_EPS)) * np.abs(V[j, 1] * x[j]))
+                      + (S[1] / (S[0] + 1e-12)) * np.abs(V[j, 1] * x[j]))
 
         if np.isnan(phi).any():
             raise ValueError('NaN values computed for phi.')
@@ -204,7 +219,7 @@ class FADEx:
         Returns the distances and indices of the k nearest neighbors of `point`
         within `data` using a ball-tree structure.
         '''
-        nbrs = NearestNeighbors(n_neighbors=self.n_neighbors, algorithm='ball_tree', n_jobs=_N_JOBS)
+        nbrs = NearestNeighbors(n_neighbors=self.n_neighbors, algorithm='ball_tree', n_jobs=2)
         nbrs.fit(data)
         dist, indices = nbrs.kneighbors(point.reshape(1, -1))
         return dist, indices
@@ -213,30 +228,13 @@ class FADEx:
     def _ridge_wls(X: np.ndarray, Y: np.ndarray, w: np.ndarray, lam: float) -> np.ndarray:
         '''
         Solves the weighted ridge least-squares problem:
-
-            argmin_B  sum_i w_i * ||X_i B - Y_i||^2 + lam * ||B||^2
-
-        First attempts a direct solve via the normal equations. Falls back to a
-        robust augmented-system formulation if the matrix is singular.
-
-        Returns B of shape (p, d).
         '''
         p  = X.shape[1]
         Xw = X * w[:, None]                      # (k, p)
         A  = X.T @ Xw + lam * np.eye(p)          # (p, p)
         B  = X.T @ (Y * w[:, None])              # (p, d)
 
-        try:
-            return np.linalg.solve(A, B)
-        except np.linalg.LinAlgError:
-            # Robust fallback: equivalent ridge via augmented system
-            sw    = np.sqrt(w)
-            X1    = X * sw[:, None]
-            Y1    = Y * sw[:, None]
-            X_aug = np.vstack([X1, np.sqrt(lam) * np.eye(p)])
-            Y_aug = np.vstack([Y1, np.zeros((p, Y.shape[1]))])
-            Bt, *_ = np.linalg.lstsq(X_aug, Y_aug, rcond=None)
-            return Bt
+        return np.linalg.solve(A, B)
 
     def _compute_jac_ls(
         self,
@@ -249,16 +247,6 @@ class FADEx:
         Estimates the Jacobian of the DR mapping at `high_dim_point` using
         locally-weighted ridge least squares.
 
-        Local displacement vectors delta_X = X_neighbors - x and
-        delta_Y = Y_neighbors - y form the regression problem:
-
-            delta_Y ≈ delta_X @ B
-
-        where B.T is the Jacobian J of shape (d, D).
-
-        Neighbors closer to the query point receive higher weight via a
-        Gaussian kernel with bandwidth equal to the median neighbor distance.
-
         Returns
         -------
         J : np.ndarray, shape (d, D)
@@ -268,30 +256,18 @@ class FADEx:
         Xn = np.asarray(high_dim_nei,   dtype=np.float64)           # (k, D)
         Yn = np.asarray(low_dim_nei,    dtype=np.float64)           # (k, d)
 
-        # Input validation
-        if Xn.ndim != 2:
-            raise ValueError(f"high_dim_nei must be 2D (k, D). Got shape={Xn.shape}")
-        if Yn.ndim == 1:
-            Yn = Yn.reshape(-1, 1)
-        if Yn.ndim != 2:
-            raise ValueError(f"low_dim_nei must be 2D (k, d). Got shape={Yn.shape}")
-        if Xn.shape[0] != Yn.shape[0]:
-            raise ValueError(f"Neighbor count mismatch: Xn={Xn.shape}, Yn={Yn.shape}")
-        if Xn.shape[0] < 2:
-            raise ValueError("Not enough neighbors to estimate Jacobian via LS (need at least 2).")
-
         # Local displacements centered at the query point
         delta_X = Xn - x[None, :]   # (k, D)
         delta_Y = Yn - y[None, :]   # (k, d)
 
-        # Gaussian distance weights — closer neighbors contribute more
+        # Gaussian distance weights
         distances          = np.linalg.norm(delta_X, axis=1)                            # (k,)
         positive_distances = distances[distances > 0]
         sigma              = float(max(
             np.median(positive_distances) if positive_distances.size > 0 else 1.0,
-            _RIDGE_EPS
+            _EPS
         ))
-        weights = np.exp(-(distances ** 2) / (_SIGMA_FACTOR * sigma ** 2))             # (k,)
+        weights = np.exp(-(distances ** 2) / (2 * sigma ** 2))             # (k,)
 
         # Solve the weighted ridge system and transpose to Jacobian shape
         Bt = self._ridge_wls(delta_X, delta_Y, weights, self.ridge_lambda)  # (D, d)
@@ -414,7 +390,7 @@ class FADEx:
         -------
         dict with keys:
             "phi"               — importance scores, shape (n_features,)
-            "spectral_norm"     — spectral norm of the Jacobian (float)
+            "SND"               — spectral norm of the Jacobian (float)
             "jac"               — full Jacobian, shape (d, n_features)
             "feature_names_top" — names of the top-n features
         '''
@@ -439,10 +415,13 @@ class FADEx:
             high_dim_point, high_dim_nei, keep_mask, _ = self._drop_const_features(
                 high_dim_point, high_dim_nei
             )
+
         if self.use_pca:
             pca          = PCA(n_components=0.95, svd_solver='full')
             high_dim_nei = pca.fit_transform(high_dim_nei)
             high_dim_point = pca.transform(high_dim_point[None, :])[0]
+
+        if self.verbose: print(f'[FADEx] New Dimension: {high_dim_nei.shape[1]}')
 
         # --- Jacobian estimation ---
         jac = self._compute_jac_ls(high_dim_point, low_dim_point, high_dim_nei, low_dim_nei)
@@ -463,21 +442,21 @@ class FADEx:
 
         # --- Importance and distortion ---
         phi           = self._compute_importance(jac, x0)
-        spectral_norm = np.linalg.norm(jac, ord=2)
+        SND = np.linalg.norm(jac, ord=2)
 
-        if np.isnan(spectral_norm):
+        if np.isnan(SND):
             raise ValueError("Spectral Norm is NaN.")
 
         # --- Top features ---
         _, feature_names_top = self._get_top_features(phi, n_top)
 
         if show:
-            self._explanation_plot(phi, spectral_norm, explain_index,
+            self._explanation_plot(phi, SND, explain_index,
                                    feature_names_top, width, height, n_top, save_fig)
 
         return {
             "phi":               phi,
-            "spectral_norm":     spectral_norm,
+            "SND":               SND,
             "jac":               jac,
             "feature_names_top": feature_names_top,
         }
@@ -491,17 +470,27 @@ class FADEx:
         plot_feature_heatmap(), and plot_grid_feature_vectors() when cached
         results are not yet available.
         '''
+
+        # Turns verbose off to avoid clutter
+        switch = False
+        if self.verbose: 
+            self.verbose = False
+            switch = True
+
         results = [
             self.fit(i, show=False)
-            for i in tqdm(range(self.n_samples), desc="Processing instances", unit="instance")
+            for i in tqdm(range(self.n_samples), desc="[FADEx] Processing Instances", unit="instance")
         ]
 
+        if switch:
+            self.verbose = True
+
         self.all_phis  = np.asarray([r["phi"]          for r in results])
-        self.all_norms = np.asarray([r["spectral_norm"] for r in results])
+        self.all_norms = np.asarray([r["SND"]          for r in results])
         self.all_jacs  = np.asarray([r["jac"]          for r in results])
 
     def fit_cluster(self, cluster_ids: np.ndarray, n_top: int = 10,
-                    show: bool = False, save_fig: bool = False) -> Tuple[np.ndarray, List[str]]:
+                    show: bool = False, save_fig: bool = False) -> Dict:
         '''
         Computes a cluster-level feature importance by averaging phi over all
         instances in `cluster_ids`.
@@ -539,9 +528,57 @@ class FADEx:
                                    feature_names_top=feature_names_top, n_top=n_top,
                                    save_fig=save_fig)
 
-        return phi_cluster, feature_names_top
+        return {
+            "phi_cluster":       phi_cluster,
+            "feature_names_top": feature_names_top
+        }
 
-    def interactive_plot(self, width: int = 10, height: int = 8) -> None:
+    def plot_distortion(self, width: int = 10, height: int = 10, save_fig: bool = False) -> None:
+        '''
+        Plots the projected space colored with the SND distortion metric. Cold colors correspond
+        to shrinking (SND < 1) and warm colors correspond to stretching (SND > 1).
+        '''
+
+        if self.all_norms is None:
+            self._fit_all()
+        
+        low_dim_data = self.low_dim_data
+        norms = np.asarray(self.all_norms, dtype=float).flatten()
+
+        vmin = float(np.nanmin(norms))
+        vmax = float(np.nanmax(norms))
+        vmin = min(vmin, 1.0 - 1e-9)
+        vmax = max(vmax, 1.0 + 1e-9)
+        div_norm = mcolors.TwoSlopeNorm(vcenter=1.0, vmin=vmin, vmax=vmax)
+
+        fig, ax = plt.subplots(figsize=(width, height))
+        sc = ax.scatter(
+            low_dim_data[:, 0],
+            low_dim_data[:, 1],
+            c=norms,
+            cmap=_CMAP,
+            norm=div_norm,
+            s=20,
+            alpha=0.7,
+        )
+
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Spectral Norm", rotation=270, labelpad=15)
+        cbar.set_ticks([vmin, 1.0, vmax])
+        cbar.set_ticklabels([f"{vmin:.2f}", "1.00", f"{vmax:.2f}"])
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.axis("off")
+        plt.tight_layout()
+
+        if save_fig:
+            fig.savefig('FADEx_SND_distortion_plot.pdf')
+
+        plt.show()
+
+    def interactive_plot(self, width: int = 10, height: int = 8, 
+                        show_features: bool = False) -> None:
         '''
         Generates an interactive Plotly scatter plot of the 2D embedding.
 
@@ -559,13 +596,15 @@ class FADEx:
         formatted_text = []
         for i, phi_row in enumerate(self.all_phis):
 
-            # Sort features by absolute importance (descending)
-            sorted_features = sorted(
-                zip(self.feature_names, phi_row),
-                key=lambda x: abs(x[1]),
-                reverse=True,
-            )
-            features_str = "<br>".join(f"{name}: {val:.3f}" for name, val in sorted_features)
+            if show_features:
+                # Sort features by absolute importance (descending)
+                sorted_features = sorted(
+                    zip(self.feature_names, phi_row),
+                    key=lambda x: abs(x[1]),
+                    reverse=True,
+                )
+                features_str = "<br>".join(f"{name}: {val:.3f}" for name, val in sorted_features)
+            else: features_str = ""
 
             # Optional class label prefix
             class_str = ""
@@ -575,28 +614,42 @@ class FADEx:
             norm_str = f"Spectral Norm: {self.all_norms[i]:.3f}"
             formatted_text.append(f"{class_str}ID: {i}<br>{norm_str}<br><br>{features_str}")
 
-        # Color points by spectral norm value
         norms = np.asarray(self.all_norms, dtype=float)
+
+        # Normalizing so 1 maps to 0.5 (no distortion color)
+        vmin = float(np.nanmin(norms))
+        vmax = float(np.nanmax(norms))
+        vmin = min(vmin, 1.0 - 1e-9)
+        vmax = max(vmax, 1.0 + 1e-9)
+
+        normed = np.where(
+            norms <= 1.0,
+            0.5 * (norms - vmin) / (1.0 - vmin),
+            0.5 + 0.5 * (norms - 1.0) / (vmax - 1.0),
+        )
 
         fig = go.Figure(data=go.Scatter(
             x=self.low_dim_data[:, 0],
             y=self.low_dim_data[:, 1],
             mode='markers',
             marker=dict(
-                size=_MARKER_SIZE,
-                color=norms,
-                colorscale=_COLORSCALE,
-                reversescale=True,
-                cmin=float(np.min(norms)),
-                cmax=float(np.max(norms)),
+                size=7,
+                color=normed,
+                colorscale=_PLOTLY_CMAP,
+                cmin=0,
+                cmax=1,
                 showscale=True,
+                colorbar=dict(
+                    tickvals=[0, 0.5, 1],
+                    ticktext=[f"{vmin:.2f}", "1.00", f"{vmax:.2f}"],
+                ),
             ),
             text=formatted_text,
             hovertemplate='%{text}<extra></extra>',
         ))
 
         fig.update_layout(
-            title=f"Interactive Plot | Mean Spectral Norm: {np.mean(norms):.3f}",
+            title=f"Interactive Plot",
             hovermode='closest',
             width=width_px,
             height=height_px,
@@ -629,13 +682,13 @@ class FADEx:
 
         plt.figure(figsize=(width, height))
         plt.barh(feature_sums_sorted.index, feature_sums_sorted.values)
-        plt.tick_params(axis='y', which='both', labelsize=_LABEL_FONTSIZE)
+        plt.tick_params(axis='y', which='both', labelsize=16)
         plt.xticks([])
         plt.gca().invert_yaxis()
         plt.tight_layout()
 
         if save_fig:
-            plt.savefig("FADEx_importance_plot.pdf", format="pdf")
+            plt.savefig("FADEx_importance_plot.pdf")
 
         plt.show()
 
@@ -674,29 +727,29 @@ class FADEx:
 
         plt.tight_layout()
         if save_fig:
-            plt.savefig(f'explanation_plot_instance_{explain_index}_top_{n_top}.pdf')
+            plt.savefig(f'FADEx_explanation_plot_instance_{explain_index}_top_{n_top}.pdf')
 
         plt.show()
         return feature_names_top
 
-    def plot_grid_feature_vectors(self, features_to_plot: list, labels=None,
+    def plot_grid_feature_vectors(self, feature, labels=None,
                                   mask=None, grid_bins: int = 15, min_points: int = 1,
                                   scale_factor: float = 1.0, width: int = 12,
-                                  height: int = 10, save: bool = False) -> None:
+                                  height: int = 10, save_fig: bool = False) -> None:
         """
         Overlays Jacobian-based feature vectors on the 2D embedding using a grid.
 
         The embedding plane is divided into a (grid_bins × grid_bins) grid. For
         each occupied cell the mean Jacobian is computed and the selected feature
-        columns are drawn as arrows. Arrow color encodes magnitude:
+        column is drawn as an arrow. Arrow color encodes magnitude:
 
-        - norm < 1  : minimum colormap color (no noteworthy distortion).
+        - norm < 1  : minimum colormap color.
         - norm >= 1 : length capped to 1, color scales with excess magnitude.
 
         Parameters
         ----------
-        features_to_plot : list of str or int
-            Features to visualize (by name or index). Duplicates are removed.
+        feature : str or int
+            Feature to visualize (by name or index).
         labels : array-like, optional
             Class labels for background scatter coloring.
         mask : array-like of bool, optional
@@ -713,10 +766,7 @@ class FADEx:
             If True, saves the plot as a PDF.
         """
 
-        # --- Feature validation: map names/indices to column indices ---
-        feature_indices = list(dict.fromkeys(
-            self._resolve_feature(f)[0] for f in features_to_plot
-        ))
+        feat_idx, feat_name = self._resolve_feature(feature)
 
         # --- Build 2D grid over the embedding ---
         x_data = self.low_dim_data[:, 0]
@@ -728,7 +778,6 @@ class FADEx:
         x_bins = np.linspace(x_data.min() - x_margin, x_data.max() + x_margin, grid_bins + 1)
         y_bins = np.linspace(y_data.min() - y_margin, y_data.max() + y_margin, grid_bins + 1)
 
-        # Assign each point to its grid cell
         x_indices = np.digitize(x_data, x_bins) - 1
         y_indices = np.digitize(y_data, y_bins) - 1
 
@@ -740,7 +789,6 @@ class FADEx:
             discrete_cmap = plt.get_cmap('Pastel1', num_classes)
             if mask is not None:
                 mask = np.array(mask, dtype=bool)
-                # Unmasked points in gray, masked (highlighted) points on top
                 ax.scatter(x_data[~mask], y_data[~mask], color='lightgray',
                            s=30, alpha=0.3, edgecolors='none', zorder=1)
                 ax.scatter(x_data[mask], y_data[mask], c=labels[mask],
@@ -752,7 +800,7 @@ class FADEx:
             ax.scatter(x_data, y_data, s=30, color='lightgray',
                        alpha=0.75, edgecolors='none', zorder=1)
 
-        # --- Collect occupied cells and their point indices ---
+        # --- Collect occupied cells ---
         valid_cells = []
         for i in range(grid_bins):
             for j in range(grid_bins):
@@ -762,25 +810,22 @@ class FADEx:
 
         # --- Compute mean Jacobian per cell and collect arrow data ---
         vectors_data = []
-        max_norm     = 1.0   # Floor value prevents division by zero in color mapping
+        max_norm     = 1.0
 
-        for i, j, pts_idx in tqdm(valid_cells, desc="Computing grid cells"):
+        for i, j, pts_idx in tqdm(valid_cells, desc="[FADEx] Computing grid cells"):
             cx = (x_bins[i] + x_bins[i + 1]) / 2.0
             cy = (y_bins[j] + y_bins[j + 1]) / 2.0
 
-            # Average Jacobian over all points in the cell
             mean_jac = np.mean([self._get_jacobian(idx) for idx in pts_idx], axis=0)
+            vec  = mean_jac[:, feat_idx] * scale_factor
+            norm = np.linalg.norm(vec)
+            if norm > max_norm:
+                max_norm = norm
+            vectors_data.append({'cx': cx, 'cy': cy, 'vec': vec, 'norm': norm})
 
-            for feat_idx in feature_indices:
-                vec  = mean_jac[:, feat_idx] * scale_factor
-                norm = np.linalg.norm(vec)
-                if norm > max_norm:
-                    max_norm = norm
-                vectors_data.append({'cx': cx, 'cy': cy, 'vec': vec, 'norm': norm})
-
-        # --- Draw arrows with magnitude-based coloring ---
+        # --- Draw arrows ---
         cmap     = plt.get_cmap('plasma_r')
-        vec_mult = _VEC_SCALE * (x_data.max() - x_data.min()) / grid_bins
+        vec_mult = 0.8 * (x_data.max() - x_data.min()) / grid_bins
 
         for data in vectors_data:
             cx, cy = data['cx'], data['cy']
@@ -801,7 +846,7 @@ class FADEx:
                 zorder=4,
             )
 
-        # --- Colorbar (only when vectors exceed unit length) ---
+        # --- Colorbar ---
         if max_norm > 1.0:
             norm_cb = mcolors.Normalize(vmin=1.0, vmax=max_norm)
             sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm_cb)
@@ -809,16 +854,14 @@ class FADEx:
             cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label("Original vector magnitude (capped at 1)", rotation=270, labelpad=15)
 
-        # Title shows up to 3 feature names with ellipsis if more
-        title_feats = [self.feature_names[i] for i in feature_indices[:3]]
-        features_str = ", ".join(title_feats) + ("..." if len(feature_indices) > 3 else "")
-        ax.set_title(f"Vector Field: {features_str}", fontsize=14)
+        ax.set_title(f"Vector Field: {feat_name}", fontsize=14)
         ax.axis('equal')
 
         self._configure_clean_axes(ax)
         plt.tight_layout()
-        if save:
-            plt.savefig(f'feature_vectors_{features_to_plot}.pdf')
+        if save_fig:
+            safe_name = str(feat_name).replace("/", "_").replace(" ", "_")
+            plt.savefig(f'FADEx_influence_vectors_{safe_name}.pdf')
         plt.show()
 
     def plot_feature_heatmap(self, feature, gridsize: int = 30, cmap: str = 'magma',
@@ -829,7 +872,7 @@ class FADEx:
 
         The figure background is set to the darkest tone of the colormap for
         contrast, and real data points are shown as faint white dots to provide
-        spatial context. Calls _fit_all() automatically if needed.
+        spatial context.
 
         Parameters
         ----------
@@ -891,8 +934,6 @@ class FADEx:
         plt.tight_layout()
 
         if save:
-            safe_name = str(feature_name).replace("/", "_").replace(" ", "_")
-            plt.savefig(f'heatmap_importance_{safe_name}.pdf',
-                        facecolor=fig.get_facecolor(), transparent=False)
+            plt.savefig(f'FADEx_heatmap_importance_{feature_name}.pdf')
 
         plt.show()
