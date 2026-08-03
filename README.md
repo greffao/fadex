@@ -5,6 +5,7 @@ Feature Attribution and Distortion-based Explanation of Dimensionality Reduction
 [![PyPI version](https://img.shields.io/pypi/v/fadex-exp?color=blue&label=PyPI)](https://pypi.org/project/fadex-exp/)
 [![Downloads](https://img.shields.io/pypi/dm/fadex-exp?color=brightgreen&label=Downloads)](https://pypi.org/project/fadex-exp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![arXiv](https://img.shields.io/badge/arXiv-2607.27463-b31b1b.svg)](https://arxiv.org/abs/2607.27463)
 </center>
 
 ---
@@ -20,6 +21,18 @@ $$
 where $v_{ij}$ denotes the $j$-th entry of the $i$-th right singular vector, $\lambda_i$ is the $i$-th singular value, and $x_j$ is the value of feature $j$.
 
 The **spectral norm** of the Jacobian is used as a local distortion measure — how much the DR algorithm stretched or compressed the neighborhood around each point.
+
+---
+
+# Paper
+
+FADEx will be published in **IEEE Transactions on Visualization and Computer Graphics (TVCG)**. A preprint is available on arXiv:
+
+> Lucas Greff Meneses, Evandro S. Ortigossa, Claudio Silva, Luis Gustavo Nonato.
+> **FADEx: Feature Attribution and Distortion-based Explanation of Dimensionality Reduction.**
+> arXiv:2607.27463, 2026.
+
+**[Read the preprint on arXiv »](https://arxiv.org/abs/2607.27463)**
 
 ---
 
@@ -117,9 +130,7 @@ result = fadex.fit(
 )
 ```
 
-Computes the FADEx explanation for a single instance. Returns a dict with keys `"phi"`, `"spectral_norm"`, `"jac"`, and `"feature_names_top"`. When `show=True`, displays a feature importance bar chart for that instance:
-
-![fit importance ranking](https://raw.githubusercontent.com/greffao/fadex/main/figs/fit.png)
+Computes the FADEx explanation for a single instance. Returns a dict with keys `"phi"`, `"spectral_norm"`, `"jac"`, and `"feature_names_top"`. When `show=True`, displays a feature importance bar chart for that instance.
 
 ---
 
@@ -149,9 +160,7 @@ fadex.importance_plot(
 )
 ```
 
-Runs FADEx on the entire dataset, sums `phi` across all instances, and plots a global feature importance ranking:
-
-![importance plot](https://raw.githubusercontent.com/greffao/fadex/main/figs/importance.png)
+Runs FADEx on the entire dataset, sums `phi` across all instances, and plots a global feature importance ranking.
 
 ---
 
@@ -164,9 +173,7 @@ fadex.interactive_plot(
 )
 ```
 
-Displays an interactive Plotly scatter plot of the 2D embedding. Points are colored by their spectral norm, and hovering over a point shows its feature importance breakdown:
-
-![interactive plot](https://raw.githubusercontent.com/greffao/fadex/main/figs/interactive.png)
+Displays an interactive Plotly scatter plot of the 2D embedding. Points are colored by their spectral norm, and hovering over a point shows its feature importance breakdown.
 
 ---
 
@@ -190,9 +197,6 @@ Overlays Jacobian-based feature vectors on the 2D embedding using a grid. The em
 
 `features_to_plot` accepts feature names (strings) or column indices (integers).
 
-<!-- ADD VECTOR FIELD FIGURE HERE -->
-<!-- ![vector field](https://raw.githubusercontent.com/greffao/fadex/main/figs/vector_field.png) -->
-
 ---
 
 ### `plot_feature_heatmap`
@@ -211,8 +215,5 @@ fadex.plot_feature_heatmap(
 Renders a hexbin heatmap on the 2D embedding showing where a specific feature has the highest importance. The background is set to the darkest tone of the colormap for visual contrast, and real data points are shown as faint white dots for spatial context.
 
 `feature` accepts a feature name (string) or column index (integer).
-
-<!-- ADD HEATMAP FIGURE HERE -->
-<!-- ![heatmap](https://raw.githubusercontent.com/greffao/fadex/main/figs/heatmap.png) -->
 
 ---
